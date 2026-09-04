@@ -9,7 +9,7 @@ from xvc2_student.config import ExperimentConfig
 from xvc2_student.losses import valid_feature_loss
 from xvc2_student.model import StreamingPhoneEncoder
 from xvc2_student.smoke import tiny_config
-from xvc2_student.teacher import loading_failures
+from xvc2_student.teacher import loading_failures, remap_legacy_position_conv
 
 
 def test_forward_and_feature_loss() -> None:
@@ -76,3 +76,20 @@ def test_teacher_loading_failures_reject_incomplete_checkpoint() -> None:
         }
     )
     assert failures == ["teacher_missing_keys=['encoder.position.weight']"]
+
+
+def test_remap_legacy_position_conv() -> None:
+    old_g = "wav2vec2.encoder.pos_conv_embed.conv.weight_g"
+    old_v = "wav2vec2.encoder.pos_conv_embed.conv.weight_v"
+    state = {old_g: torch.ones(1), old_v: torch.zeros(1), "other": torch.ones(1)}
+    remapped = remap_legacy_position_conv(state)
+    assert old_g not in remapped
+    assert old_v not in remapped
+    assert (
+        remapped["wav2vec2.encoder.pos_conv_embed.conv.parametrizations.weight.original0"]
+        is state[old_g]
+    )
+    assert (
+        remapped["wav2vec2.encoder.pos_conv_embed.conv.parametrizations.weight.original1"]
+        is state[old_v]
+    )
