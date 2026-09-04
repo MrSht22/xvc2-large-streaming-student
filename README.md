@@ -41,6 +41,7 @@ xvc2-student-env-check --require-cuda
 
 只有输出 `ctc_gop_student_environment=PASS` 才可直接复用。该检查覆盖依赖版本、
 Torch/torchaudio minor version、CUDA 可见性、Emformer 和 Wav2Vec2FeatureEncoder API。
+`cmudict` 不属于本仓库的训练期依赖：manifest 中的 phone IDs 必须在训练前预先生成。
 
 第二条命令会实例化完整 90M 模型并执行一次合成前向/反向，CPU 会较慢。
 

@@ -10,11 +10,10 @@ from typing import Any
 
 
 REQUIREMENTS = {
-    "cmudict": ((1, 1), None),
     "PyYAML": ((6, 0), None),
     "torch": ((2, 4), None),
     "torchaudio": ((2, 4), None),
-    "transformers": ((4, 57), (5, 0)),
+    "transformers": ((4, 44), (5, 0)),
 }
 
 

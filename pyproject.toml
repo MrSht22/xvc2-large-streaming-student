@@ -8,11 +8,10 @@ version = "0.1.0"
 description = "Large limited-lookahead phone encoder for X-VC2"
 requires-python = ">=3.10"
 dependencies = [
-  "cmudict>=1.1",
   "PyYAML>=6.0",
   "torch>=2.4",
   "torchaudio>=2.4",
-  "transformers>=4.57,<5",
+  "transformers>=4.44,<5",
 ]
 
 [project.optional-dependencies]
