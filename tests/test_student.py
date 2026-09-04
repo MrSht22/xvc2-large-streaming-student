@@ -3,6 +3,8 @@ from pathlib import Path
 import torch
 
 from xvc2_student.checkpoint import load_checkpoint, save_checkpoint
+from xvc2_student.audit import audit_manifests
+from xvc2_student.env_check import version_tuple
 from xvc2_student.config import ExperimentConfig
 from xvc2_student.losses import valid_feature_loss
 from xvc2_student.model import StreamingPhoneEncoder
@@ -35,3 +37,30 @@ def test_checkpoint_roundtrip(tmp_path: Path) -> None:
     assert payload["data_state"] == {"epoch": 2}
     for first, second in zip(model.parameters(), restored.parameters()):
         torch.testing.assert_close(first, second)
+
+
+def test_manifest_audit_detects_split_leakage(tmp_path: Path) -> None:
+    import json
+    import wave
+
+    audio = tmp_path / "audio.wav"
+    with wave.open(str(audio), "wb") as stream:
+        stream.setnchannels(1)
+        stream.setsampwidth(2)
+        stream.setframerate(16_000)
+        stream.writeframes(b"\x00\x00" * 320)
+    paths = []
+    for split, utterance in (("train", "1-2-3"), ("val", "1-4-5")):
+        path = tmp_path / f"{split}.jsonl"
+        path.write_text(
+            json.dumps({"utterance_id": utterance, "audio_path": str(audio), "phone_ids": [1, 2]})
+            + "\n"
+        )
+        paths.append((split, path))
+    report = audit_manifests(paths)
+    assert report["status"] == "FAIL"
+    assert report["leakage"]["speaker"]["count"] == 1
+
+
+def test_version_tuple() -> None:
+    assert version_tuple("2.4.1+cu121") == (2, 4, 1)

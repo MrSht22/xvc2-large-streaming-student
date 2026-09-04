@@ -33,6 +33,15 @@ xvc2-student-smoke
 xvc2-student-smoke --config configs/student_12x768.yaml
 ```
 
+已有 `ctc-gop` 环境先运行：
+
+```bash
+xvc2-student-env-check --require-cuda
+```
+
+只有输出 `ctc_gop_student_environment=PASS` 才可直接复用。该检查覆盖依赖版本、
+Torch/torchaudio minor version、CUDA 可见性、Emformer 和 Wav2Vec2FeatureEncoder API。
+
 第二条命令会实例化完整 90M 模型并执行一次合成前向/反向，CPU 会较慢。
 
 ## Manifest
@@ -48,6 +57,37 @@ xvc2-student-smoke --config configs/student_12x768.yaml
 ```
 
 G2P 和数据审计应在训练前完成，不在 DataLoader 内动态访问网络或下载 NLTK 资源。
+
+```bash
+xvc2-student-audit manifest \
+  --manifest train=/path/train.jsonl \
+  --manifest validation=/path/validation.jsonl
+
+xvc2-student-audit teacher \
+  --teacher /path/is24/models/checkpoint-8000 \
+  --config configs/student_12x768.yaml \
+  --device cuda:0
+```
+
+第一条检查音频可读性、采样率、时长、重复 ID、phone ID 范围和 speaker/chapter split
+leakage。第二条拒绝 Git LFS pointer，并验证 Layer 20 为 1024 维、词表为 40 类以及
+Teacher/Student 50 Hz 帧长一致。
+
+## 资源 Benchmark
+
+单卡与两卡 DDP 分别运行：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 xvc2-student-benchmark \
+  --config configs/student_12x768.yaml --batch-size 1 --audio-seconds 3.2
+
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  -m xvc2_student.benchmark \
+  --config configs/student_12x768.yaml --batch-size 1 --audio-seconds 3.2
+```
+
+输出包含每步耗时、global audio seconds/second 和每 rank 峰值显存。它使用合成 Teacher
+target 和 CTC target，只验证工程与资源，不代表真实蒸馏收敛质量。
 
 ## 训练
 
@@ -93,4 +133,3 @@ Teacher -> Emformer Student 表征蒸馏，因此 v1 没有引入 Flow/SDE、GRP
   严格的 prefix target causality audit，再单独实现和验证。
 - 正式训练前仍需运行 960h manifest audit、单卡/多卡显存 benchmark 和
   full/chunk/reset/flush acceptance。
-
