@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xvc2-large-streaming-student"
+version = "0.1.0"
+description = "Large limited-lookahead phone encoder for X-VC2"
+requires-python = ">=3.10"
+dependencies = [
+  "cmudict>=1.1",
+  "PyYAML>=6.0",
+  "torch>=2.4",
+  "torchaudio>=2.4",
+  "transformers>=4.57,<5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.12"]
+
+[project.scripts]
+xvc2-student-train = "xvc2_student.train:main"
+xvc2-student-smoke = "xvc2_student.smoke:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
