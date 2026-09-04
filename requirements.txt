@@ -1,0 +1,13 @@
+# Known-good environment for Python 3.10 and the X-VC2 Student training code.
+# Install the matching CUDA build of torch/torchaudio before this file when
+# the target GPU requires a PyTorch index other than the default one.
+numpy==1.26.4
+PyYAML==6.0.2
+soundfile==0.12.1
+torch==2.4.1
+torchaudio==2.4.1
+transformers==4.44.2
+
+# Server-side validation tools.
+pytest>=8,<9
+ruff>=0.12,<1

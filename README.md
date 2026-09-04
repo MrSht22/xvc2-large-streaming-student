@@ -27,11 +27,21 @@ baseline，不用于恢复新模型权重。
 
 ## 安装与 Smoke
 
+推荐使用 Python 3.10。先安装与目标 GPU 匹配的 PyTorch CUDA wheel，再安装其余固定依赖
+和本仓库：
+
 ```bash
-python -m pip install -e '.[dev]'
+python -m pip install --index-url https://download.pytorch.org/whl/cu121 \
+  torch==2.4.1 torchaudio==2.4.1
+python -m pip install -r requirements.txt
+python -m pip install -e . --no-deps
 xvc2-student-smoke
 xvc2-student-smoke --config configs/student_12x768.yaml
 ```
+
+以上是已经通过 Teacher audit 的 CUDA 12.1 组合。若新 GPU 必须使用其他 CUDA wheel，先替换
+第一条命令中的 PyTorch index，但必须保持 `torch` 和 `torchaudio` 的版本完全一致。系统还需要
+可工作的 NVIDIA driver；Conda 环境不需要单独安装完整 CUDA Toolkit。
 
 已有 `ctc-gop` 环境先运行：
 
