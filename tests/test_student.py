@@ -9,6 +9,7 @@ from xvc2_student.config import ExperimentConfig
 from xvc2_student.losses import valid_feature_loss
 from xvc2_student.model import StreamingPhoneEncoder
 from xvc2_student.smoke import tiny_config
+from xvc2_student.teacher import loading_failures
 
 
 def test_forward_and_feature_loss() -> None:
@@ -64,3 +65,14 @@ def test_manifest_audit_detects_split_leakage(tmp_path: Path) -> None:
 
 def test_version_tuple() -> None:
     assert version_tuple("2.4.1+cu121") == (2, 4, 1)
+
+
+def test_teacher_loading_failures_reject_incomplete_checkpoint() -> None:
+    failures = loading_failures(
+        {
+            "missing_keys": ["encoder.position.weight"],
+            "unexpected_keys": [],
+            "mismatched_keys": [],
+        }
+    )
+    assert failures == ["teacher_missing_keys=['encoder.position.weight']"]

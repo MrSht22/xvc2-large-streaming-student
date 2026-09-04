@@ -12,7 +12,7 @@ import torchaudio
 
 from .config import load_config
 from .model import StreamingPhoneEncoder
-from .teacher import load_teacher, teacher_targets
+from .teacher import load_teacher_with_loading_info, loading_failures, teacher_targets
 
 
 def audio_metadata(path: Path) -> tuple[int, int]:
@@ -143,9 +143,17 @@ def audit_teacher(
     if not failures:
         config = load_config(config_path)
         resolved_device = torch.device(device)
-        teacher = load_teacher(teacher_path).to(resolved_device)
+        teacher, loading_info = load_teacher_with_loading_info(teacher_path)
+        details["loading_info"] = {
+            name: loading_info.get(name, [])
+            for name in ("missing_keys", "unexpected_keys", "mismatched_keys")
+        }
+        failures.extend(loading_failures(loading_info))
+        teacher = teacher.to(resolved_device)
         if teacher.config.vocab_size != config.model.vocab_size:
             failures.append(f"teacher_vocab_size={teacher.config.vocab_size}")
+        if failures:
+            return {**details, "failures": failures, "status": "FAIL"}
         samples = max(round(seconds * 16_000), 400)
         waveform = torch.zeros(1, samples, device=resolved_device)
         lengths = torch.tensor([samples], device=resolved_device)
