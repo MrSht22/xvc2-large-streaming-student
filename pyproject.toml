@@ -21,6 +21,7 @@ dev = ["pytest>=8", "ruff>=0.12"]
 xvc2-student-audit = "xvc2_student.audit:main"
 xvc2-student-benchmark = "xvc2_student.benchmark:main"
 xvc2-student-env-check = "xvc2_student.env_check:main"
+xvc2-student-inspect-libriheavy = "xvc2_student.inspect_libriheavy:main"
 xvc2-student-train = "xvc2_student.train:main"
 xvc2-student-smoke = "xvc2_student.smoke:main"
 

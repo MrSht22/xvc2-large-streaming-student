@@ -59,6 +59,20 @@ Torch/torchaudio minor version、CUDA 可见性、Emformer 和 Wav2Vec2FeatureEn
 
 G2P 和数据审计应在训练前完成，不在 DataLoader 内动态访问网络或下载 NLTK 资源。
 
+### LibriHeavy 仓库检查
+
+在生成正式 manifest 前，先检查 LibriHeavy/LibriLight 的实际落盘结构：
+
+```bash
+xvc2-student-inspect-libriheavy \
+  --root /path/to/libriheavy \
+  --audio-root /path/to/librilight \
+  --output-dir runs/libriheavy-inspection
+```
+
+脚本只读取目录、Lhotse `jsonl/jsonl.gz` 和音频路径，不解码或修改音频。默认每个 manifest
+抽样 2,000 行，输出 `report.json` 与 `report.md`，用于决定 split、文本字段和音频路径映射。
+
 ```bash
 xvc2-student-audit manifest \
   --manifest train=/path/train.jsonl \

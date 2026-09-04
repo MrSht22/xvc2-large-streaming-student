@@ -5,6 +5,7 @@ import torch
 from xvc2_student.checkpoint import load_checkpoint, save_checkpoint
 from xvc2_student.audit import audit_manifests
 from xvc2_student.env_check import version_tuple
+from xvc2_student.inspect_libriheavy import inspect_repository
 from xvc2_student.config import ExperimentConfig
 from xvc2_student.losses import valid_feature_loss
 from xvc2_student.model import StreamingPhoneEncoder
@@ -93,3 +94,44 @@ def test_remap_legacy_position_conv() -> None:
         remapped["wav2vec2.encoder.pos_conv_embed.conv.parametrizations.weight.original1"]
         is state[old_v]
     )
+
+
+def test_inspect_libriheavy_lhotse_manifest(tmp_path: Path) -> None:
+    import gzip
+    import json
+
+    audio = tmp_path / "librilight" / "small" / "speaker" / "book.flac"
+    audio.parent.mkdir(parents=True)
+    audio.write_bytes(b"not-decoded")
+    manifest_dir = tmp_path / "upper_no_punc" / "lhotse"
+    manifest_dir.mkdir(parents=True)
+    manifest = manifest_dir / "libriheavy_cuts_small.jsonl.gz"
+    row = {
+        "id": "small/speaker/book_0",
+        "start": 1.0,
+        "duration": 2.5,
+        "supervisions": [
+            {
+                "recording_id": "small/speaker/book",
+                "speaker": "speaker",
+                "custom": {"texts": ["Book text.", "BOOK TEXT"]},
+            }
+        ],
+        "recording": {
+            "sources": [
+                {
+                    "type": "file",
+                    "source": "download/librilight/small/speaker/book.flac",
+                }
+            ]
+        },
+    }
+    with gzip.open(manifest, "wt", encoding="utf-8") as stream:
+        stream.write(json.dumps(row) + "\n")
+    report = inspect_repository(tmp_path, [tmp_path / "librilight"], 100, 10)
+    assert report["status"] == "PASS"
+    assert report["manifests"][0]["audio_sources_resolved"] == 1
+    assert report["manifests"][0]["text_field_counts"] == {
+        "book_text": 1,
+        "asr_text": 1,
+    }
