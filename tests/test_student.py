@@ -205,7 +205,7 @@ def test_inspect_librispeech_and_librilight(tmp_path: Path) -> None:
     assert processed["estimated_hours"] == 4 / 3600
 
 
-def test_build_codec_audio_manifests(tmp_path: Path) -> None:
+def test_build_codec_audio_manifests(tmp_path: Path, capsys) -> None:
     import json
     import wave
 
@@ -277,8 +277,13 @@ def test_build_codec_audio_manifests(tmp_path: Path) -> None:
         minimum_snr=8.0,
         maximum_speaker_hours=1.0,
         seed=1,
+        progress=True,
         num_workers=2,
     )
+    captured = capsys.readouterr()
+    assert "collecting_librispeech_train num_workers=2" in captured.out
+    assert "stage=librispeech/train-clean-100 status=START" in captured.err
+    assert "stage=librilight/vad-metadata status=DONE" in captured.err
     assert report["status"] == "PASS"
     assert report["splits"]["train"]["items"] == 5
     assert report["splits"]["validation"]["items"] == 2

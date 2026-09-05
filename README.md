@@ -137,6 +137,7 @@ PYTHONPATH=src python -m xvc2_student.build_audio_manifest \
 构建器读取所有入选候选的音频 header，因此这里的小时数是精确求和，不是检查器的抽样估算；
 最终总量最多比目标多一个 VAD 切段，超出秒数写入 `report.json`。
 `--num-workers` 并行读取音频 header；10 核节点建议从 `8` 开始，共享存储压力较大时降到 `4`。
+运行期间约每 5 秒打印当前子阶段、处理数、接受数、耗时和平均文件速度，并由 `tee` 保存到日志。
 它输出 `train_audio.jsonl`、`validation_audio.jsonl`、`test_audio.jsonl`、`report.json` 和
 `report.md`。LibriSpeech dev/test speaker 会从 LibriLight train 中排除。输出是后续提取
 Student hidden、speaker target 和可选 anchor 的 source-audio selection manifest；尚不是

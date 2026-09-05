@@ -6,6 +6,7 @@ import os
 import random
 import re
 import sys
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -21,7 +22,39 @@ LIBRISPEECH_TRAIN_SPLITS = ("train-clean-100", "train-clean-360", "train-other-5
 LIBRISPEECH_VALIDATION_SPLITS = ("dev-clean", "dev-other")
 LIBRISPEECH_TEST_SPLITS = ("test-clean", "test-other")
 SEGMENT_SUFFIX = re.compile(r"_\d+$")
-METADATA_BATCH_SIZE = 2_048
+METADATA_BATCH_SIZE = 512
+PROGRESS_INTERVAL_SECONDS = 5.0
+
+
+class ProgressPrinter:
+    def __init__(self, stage: str, enabled: bool) -> None:
+        self.stage = stage
+        self.enabled = enabled
+        self.started_at = time.monotonic()
+        self.last_printed_at = self.started_at
+        if enabled:
+            self._print(0, None, "START", self.started_at)
+
+    def update(self, processed: int, accepted: int | None = None) -> None:
+        now = time.monotonic()
+        if self.enabled and now - self.last_printed_at >= PROGRESS_INTERVAL_SECONDS:
+            self._print(processed, accepted, "RUNNING", now)
+
+    def finish(self, processed: int, accepted: int | None = None) -> None:
+        if self.enabled:
+            self._print(processed, accepted, "DONE", time.monotonic())
+
+    def _print(self, processed: int, accepted: int | None, status: str, now: float) -> None:
+        elapsed = max(now - self.started_at, 0.0)
+        rate = processed / elapsed if elapsed > 0 else 0.0
+        accepted_field = f" accepted={accepted}" if accepted is not None else ""
+        print(
+            f"progress stage={self.stage} status={status} processed={processed}"
+            f"{accepted_field} elapsed_seconds={elapsed:.1f} files_per_second={rate:.1f}",
+            file=sys.stderr,
+            flush=True,
+        )
+        self.last_printed_at = now
 
 
 def iter_audio_files(root: Path) -> Iterator[Path]:
@@ -91,6 +124,7 @@ def collect_librispeech_split(
             yield path, speaker_id, chapter_id, utterance_id, transcripts[utterance_id]
 
     index = 0
+    progress_printer = ProgressPrinter(f"librispeech/{split}", progress)
     executor_context = (
         ThreadPoolExecutor(max_workers=num_workers) if num_workers > 1 else nullcontext(None)
     )
@@ -108,7 +142,7 @@ def collect_librispeech_split(
                         "subset": split,
                         "speaker_id": speaker_id,
                         "chapter_or_book_id": chapter_id,
-                        "audio_path": str(path.resolve()),
+                        "audio_path": str(path),
                         "sample_rate": metadata["sample_rate"],
                         "channels": metadata["channels"],
                         "num_frames": metadata["num_frames"],
@@ -118,6 +152,8 @@ def collect_librispeech_split(
                 )
                 if progress and index % 50_000 == 0:
                     print(f"librispeech_{split}_audio={index}", file=sys.stderr, flush=True)
+            progress_printer.update(index)
+    progress_printer.finish(index)
     return rows
 
 
@@ -129,6 +165,8 @@ def raw_metadata_index(
     ambiguous = object()
     scanned = 0
     for subset in subsets:
+        progress_printer = ProgressPrinter(f"librilight/raw-json/{subset}", progress)
+        subset_scanned = 0
         subset_root = root / "raw" / subset
         if not subset_root.is_dir():
             raise NotADirectoryError(subset_root)
@@ -151,7 +189,7 @@ def raw_metadata_index(
                     "snr": float(value["snr"])
                     if isinstance(value.get("snr"), (int, float))
                     else None,
-                    "raw_metadata_path": str(path.resolve()),
+                    "raw_metadata_path": str(path),
                     "raw_recording_id": path.stem,
                     "book_id": book_id or None,
                     "language": book_meta.get("language"),
@@ -164,8 +202,9 @@ def raw_metadata_index(
                 else:
                     fallback[fallback_key] = item
                 scanned += 1
-                if progress and scanned % 10_000 == 0:
-                    print(f"librilight_raw_json={scanned}", file=sys.stderr, flush=True)
+                subset_scanned += 1
+                progress_printer.update(subset_scanned)
+        progress_printer.finish(subset_scanned)
     return exact, {key: value for key, value in fallback.items() if value is not ambiguous}
 
 
@@ -184,11 +223,16 @@ def collect_librilight_candidates(
     subset_seconds: Counter[str] = Counter()
     pending: list[tuple[Path, str, str, str, dict[str, Any]]] = []
     for subset in subsets:
+        progress_printer = ProgressPrinter(f"librilight/vad-index/{subset}", progress)
+        subset_seen = 0
+        subset_accepted = 0
         subset_root = root / "vad" / subset
         if not subset_root.is_dir():
             raise NotADirectoryError(subset_root)
         for path in iter_audio_files(subset_root):
             counters["audio_files_seen"] += 1
+            subset_seen += 1
+            progress_printer.update(subset_seen, subset_accepted)
             relative_path = path.relative_to(subset_root)
             if len(relative_path.parts) < 3:
                 counters["rejected_path_layout"] += 1
@@ -209,8 +253,12 @@ def collect_librilight_candidates(
                 counters["rejected_low_snr"] += 1
                 continue
             pending.append((path, subset, speaker_id, book_id, source))
+            subset_accepted += 1
+            progress_printer.update(subset_seen, subset_accepted)
+        progress_printer.finish(subset_seen, subset_accepted)
 
     processed = 0
+    progress_printer = ProgressPrinter("librilight/vad-metadata", progress)
     executor_context = (
         ThreadPoolExecutor(max_workers=num_workers) if num_workers > 1 else nullcontext(None)
     )
@@ -247,7 +295,7 @@ def collect_librilight_candidates(
                     "subset": f"vad/{subset}",
                     "speaker_id": speaker_id,
                     "chapter_or_book_id": book_id,
-                    "audio_path": str(path.resolve()),
+                    "audio_path": str(path),
                     "sample_rate": metadata["sample_rate"],
                     "channels": metadata["channels"],
                     "num_frames": metadata["num_frames"],
@@ -265,6 +313,8 @@ def collect_librilight_candidates(
                         file=sys.stderr,
                         flush=True,
                     )
+            progress_printer.update(processed, len(candidates))
+    progress_printer.finish(processed, len(candidates))
     return candidates, {
         "counts": dict(counters),
         "accepted_candidate_hours_by_subset": {
@@ -395,19 +445,19 @@ def build_manifests(
     librispeech_root = librispeech_root.expanduser().resolve()
     librilight_root = librilight_root.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
-    print("collecting_librispeech_train", flush=True)
+    print(f"collecting_librispeech_train num_workers={num_workers}", flush=True)
     train_librispeech = [
         row
         for split in LIBRISPEECH_TRAIN_SPLITS
         for row in collect_librispeech_split(librispeech_root, split, progress, num_workers)
     ]
-    print("collecting_librispeech_validation", flush=True)
+    print(f"collecting_librispeech_validation num_workers={num_workers}", flush=True)
     validation = [
         row
         for split in LIBRISPEECH_VALIDATION_SPLITS
         for row in collect_librispeech_split(librispeech_root, split, progress, num_workers)
     ]
-    print("collecting_librispeech_test", flush=True)
+    print(f"collecting_librispeech_test num_workers={num_workers}", flush=True)
     test = [
         row
         for split in LIBRISPEECH_TEST_SPLITS
@@ -417,7 +467,7 @@ def build_manifests(
     target_seconds = target_train_hours * 3600
     if librispeech_seconds >= target_seconds:
         raise ValueError("Target train hours must exceed LibriSpeech train hours")
-    print("collecting_librilight_candidates", flush=True)
+    print(f"collecting_librilight_candidates num_workers={num_workers}", flush=True)
     candidates, candidate_report = collect_librilight_candidates(
         librilight_root,
         librilight_subsets,
