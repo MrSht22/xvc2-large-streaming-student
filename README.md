@@ -83,6 +83,29 @@ xvc2-student-inspect-libriheavy \
 脚本只读取目录、Lhotse `jsonl/jsonl.gz` 和音频路径，不解码或修改音频。默认每个 manifest
 抽样 2,000 行，输出 `report.json` 与 `report.md`，用于决定 split、文本字段和音频路径映射。
 
+### LibriSpeech 与 LibriLight 原始数据检查
+
+只有两个原始数据集路径、尚不清楚目录和时长时，运行：
+
+```bash
+OUT=~/X-VC2/runs/speech-corpora-inspection
+mkdir -p "$OUT"
+
+PYTHONPATH=src python -m xvc2_student.inspect_audio_corpora \
+  --librispeech-root /absolute/path/to/LibriSpeech \
+  --librilight-root /absolute/path/to/librilight \
+  --output-dir "$OUT" \
+  --max-files-per-corpus 2000000 \
+  --metadata-samples-per-group 500 \
+  2>&1 | tee "$OUT/run.log"
+```
+
+脚本完整遍历文件名以统计实际文件数、磁盘大小、split、speaker 和 chapter/book 分布，但每个
+split 默认只随机抽样 500 个音频 header 来估算时长，不解码波形。`report.json` 保留路径和文本
+示例，`report.md` 给出紧凑汇总；若某个 split 的全部音频都被抽样，其时长会标记为精确 metadata
+求和，否则明确标记为抽样估算。把 `report.json`、`report.md` 和 `run.log` 发回后，再据此确定
+正式 manifest 的字段、split、文本来源和采样比例。
+
 ```bash
 xvc2-student-audit manifest \
   --manifest train=/path/train.jsonl \

@@ -2,11 +2,12 @@ from pathlib import Path
 
 import torch
 
-from xvc2_student.checkpoint import load_checkpoint, save_checkpoint
 from xvc2_student.audit import audit_manifests
-from xvc2_student.env_check import version_tuple
-from xvc2_student.inspect_libriheavy import inspect_repository
+from xvc2_student.checkpoint import load_checkpoint, save_checkpoint
 from xvc2_student.config import ExperimentConfig
+from xvc2_student.env_check import version_tuple
+from xvc2_student.inspect_audio_corpora import combined_report, inspect_corpus
+from xvc2_student.inspect_libriheavy import inspect_repository
 from xvc2_student.losses import valid_feature_loss
 from xvc2_student.model import StreamingPhoneEncoder
 from xvc2_student.smoke import tiny_config
@@ -135,3 +136,43 @@ def test_inspect_libriheavy_lhotse_manifest(tmp_path: Path) -> None:
         "book_text": 1,
         "asr_text": 1,
     }
+
+
+def test_inspect_librispeech_and_librilight(tmp_path: Path) -> None:
+    import wave
+
+    def write_wav(path: Path, seconds: int) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(path), "wb") as stream:
+            stream.setnchannels(1)
+            stream.setsampwidth(2)
+            stream.setframerate(16_000)
+            stream.writeframes(b"\x00\x00" * 16_000 * seconds)
+
+    librispeech_root = tmp_path / "LibriSpeech"
+    librispeech_audio = librispeech_root / "train-clean-100" / "84" / "121123"
+    write_wav(librispeech_audio / "84-121123-0001.wav", 1)
+    write_wav(librispeech_audio / "84-121123-0002.wav", 2)
+    (librispeech_audio / "84-121123.trans.txt").write_text(
+        "84-121123-0001 FIRST TEST\n84-121123-0002 SECOND TEST\n", encoding="utf-8"
+    )
+
+    librilight_root = tmp_path / "librilight"
+    librilight_audio = librilight_root / "small" / "100" / "book"
+    write_wav(librilight_audio / "recording-1.wav", 3)
+
+    librispeech = inspect_corpus("librispeech", librispeech_root, 100, 10)
+    librilight = inspect_corpus("librilight", librilight_root, 100, 10)
+    report = combined_report(librispeech, librilight)
+
+    assert report["status"] == "PASS"
+    assert report["combined"]["audio_files"] == 3
+    speech_group = librispeech["groups"]["train-clean-100"]
+    assert speech_group["unique_speakers"] == 1
+    assert speech_group["unique_chapters_or_books"] == 1
+    assert speech_group["text_files"] == 1
+    assert speech_group["duration"]["estimate_kind"] == "exact_metadata_sum"
+    assert speech_group["duration"]["estimated_hours"] == 3 / 3600
+    light_group = librilight["groups"]["small"]
+    assert light_group["duration"]["sample_rate_counts"] == {16000: 1}
+    assert light_group["duration"]["estimated_hours"] == 3 / 3600
