@@ -106,6 +106,9 @@ split 默认只随机抽样 500 个音频 header 来估算时长，不解码波�
 求和，否则明确标记为抽样估算。把 `report.json`、`report.md` 和 `run.log` 发回后，再据此确定
 正式 manifest 的字段、split、文本来源和采样比例。
 
+若 LibriLight 同时包含 `raw/` 长录音和 `vad/` 切段，报告会把它们视为同一语料的两种
+representation，分别统计但不会相加为总时长；伴随 raw 音频的 JSON 会抽样解析字段结构。
+
 ```bash
 xvc2-student-audit manifest \
   --manifest train=/path/train.jsonl \

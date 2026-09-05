@@ -26,7 +26,7 @@ LIBRISPEECH_GROUPS = {
     "train-clean-360",
     "train-other-500",
 }
-LIBRILIGHT_GROUPS = {"small", "medium", "large", "fine-tuning"}
+LIBRILIGHT_GROUPS = {"small", "medium", "large", "fine-tuning", "raw", "vad"}
 
 
 def percentile(values: list[float], fraction: float) -> float | None:
@@ -65,8 +65,13 @@ def audio_metadata(path: Path) -> dict[str, Any]:
             }
 
 
-def group_name(relative_path: Path) -> str:
-    return relative_path.parts[0] if len(relative_path.parts) > 1 else "<root>"
+def group_name(kind: str, relative_path: Path) -> str:
+    parts = relative_path.parts
+    if len(parts) <= 1:
+        return "<root>"
+    if kind == "librilight" and parts[0] in {"raw", "vad"} and len(parts) > 2:
+        return f"{parts[0]}/{parts[1]}"
+    return parts[0]
 
 
 def identities(kind: str, relative_path: Path) -> tuple[str | None, str | None]:
@@ -76,6 +81,8 @@ def identities(kind: str, relative_path: Path) -> tuple[str | None, str | None]:
     if kind == "librispeech":
         return parts[1], parts[2]
     if kind == "librilight":
+        if parts[0] in {"raw", "vad"} and len(parts) >= 5:
+            return parts[2], parts[3]
         return parts[1], parts[2]
     raise ValueError(f"Unsupported corpus kind: {kind}")
 
@@ -108,6 +115,58 @@ def transcript_preview(path: Path, maximum_lines: int = 2) -> list[str]:
     return lines
 
 
+def json_value_preview(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:500]
+    if isinstance(value, list):
+        return {
+            "type": "list",
+            "length": len(value),
+            "first_items": [json_value_preview(item) for item in value[:2]],
+        }
+    if isinstance(value, dict):
+        return {"type": "object", "keys": sorted(str(key) for key in value)[:30]}
+    return {"type": type(value).__name__}
+
+
+def json_metadata_summary(paths: list[Path]) -> dict[str, Any]:
+    key_counts: Counter[str] = Counter()
+    value_types: dict[str, Counter[str]] = {}
+    failures: list[str] = []
+    examples: list[dict[str, Any]] = []
+    for path in sorted(paths):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            failures.append(f"{path}: {type(error).__name__}: {error}")
+            continue
+        if not isinstance(value, dict):
+            failures.append(f"{path}: top_level={type(value).__name__}")
+            continue
+        key_counts.update(str(key) for key in value)
+        for key, item in value.items():
+            value_types.setdefault(str(key), Counter())[type(item).__name__] += 1
+        if len(examples) < 3:
+            examples.append(
+                {
+                    "path": str(path),
+                    "values": {str(key): json_value_preview(item) for key, item in value.items()},
+                }
+            )
+    return {
+        "files_sampled": len(paths),
+        "valid_objects": len(paths) - len(failures),
+        "top_level_key_counts": dict(key_counts.most_common()),
+        "value_type_counts": {
+            key: dict(counts.most_common()) for key, counts in sorted(value_types.items())
+        },
+        "failures": failures[:20],
+        "examples": examples,
+    }
+
+
 def empty_group() -> dict[str, Any]:
     return {
         "files": 0,
@@ -116,9 +175,11 @@ def empty_group() -> dict[str, Any]:
         "audio_bytes": 0,
         "audio_suffixes": Counter(),
         "text_files": 0,
+        "json_files": 0,
         "speakers": set(),
         "containers": set(),
         "sample_paths": [],
+        "json_sample_paths": [],
         "audio_path_examples": [],
         "text_examples": [],
     }
@@ -221,7 +282,7 @@ def inspect_corpus(
             files_scanned += 1
             path = Path(directory) / filename
             relative_path = path.relative_to(root)
-            group = group_name(relative_path)
+            group = group_name(kind, relative_path)
             summary = groups.setdefault(group, empty_group())
             try:
                 file_bytes = path.stat().st_size
@@ -252,7 +313,16 @@ def inspect_corpus(
                 )
             elif suffix in {".txt", ".tsv", ".json", ".jsonl"}:
                 summary["text_files"] += 1
-                if len(summary["text_examples"]) < 3:
+                if suffix == ".json":
+                    summary["json_files"] += 1
+                    update_reservoir(
+                        summary["json_sample_paths"],
+                        path,
+                        summary["json_files"],
+                        20,
+                        rng,
+                    )
+                elif len(summary["text_examples"]) < 3:
                     summary["text_examples"].append(
                         {"path": str(relative_path), "lines": transcript_preview(path)}
                     )
@@ -273,20 +343,18 @@ def inspect_corpus(
             "audio_bytes": summary["audio_bytes"],
             "audio_suffix_counts": dict(summary["audio_suffixes"].most_common()),
             "text_files": summary["text_files"],
+            "json_files": summary["json_files"],
             "unique_speakers": len(summary["speakers"]),
             "unique_chapters_or_books": len(summary["containers"]),
             "audio_path_examples": summary["audio_path_examples"],
             "text_examples": summary["text_examples"],
+            "json_metadata": json_metadata_summary(summary["json_sample_paths"]),
             "duration": duration,
         }
 
     total_audio_files = sum(item["audio_files"] for item in finalized_groups.values())
-    group_estimates = [
-        item["duration"]["estimated_hours"]
-        for item in finalized_groups.values()
-        if item["duration"]["estimated_hours"] is not None
-    ]
-    recognized = sorted(set(finalized_groups) & expected_groups)
+    top_level_names = {name.split("/", 1)[0] for name in finalized_groups}
+    recognized = sorted(top_level_names & expected_groups)
     warnings = []
     if truncated:
         warnings.append("file_scan_truncated")
@@ -299,11 +367,11 @@ def inspect_corpus(
         "root": str(root),
         "expected_top_level_groups": sorted(expected_groups),
         "recognized_top_level_groups": recognized,
-        "unrecognized_top_level_groups": sorted(set(finalized_groups) - expected_groups),
+        "unrecognized_top_level_groups": sorted(top_level_names - expected_groups),
         "layout_hint": (
             "split/speaker/chapter/utterance.flac"
             if kind == "librispeech"
-            else "subset/speaker/book/recording.flac"
+            else "subset/speaker/book/recording.flac or raw|vad/subset/speaker/book/file.flac"
         ),
         "files_scanned": files_scanned,
         "directories_scanned": directories_scanned,
@@ -312,11 +380,38 @@ def inspect_corpus(
         "suffix_counts": dict(suffixes.most_common()),
         "relative_path_depth_counts": dict(sorted(depth_counts.items())),
         "audio_files": total_audio_files,
-        "estimated_hours": sum(group_estimates) if group_estimates else None,
+        "estimated_hours": corpus_hours(kind, finalized_groups),
+        "representation_estimated_hours": representation_hours(kind, finalized_groups),
         "groups": finalized_groups,
         "warnings": warnings,
-        "status": "PASS" if total_audio_files and recognized else "NEEDS_ATTENTION",
+        "status": (
+            "PASS" if total_audio_files and recognized and not truncated else "NEEDS_ATTENTION"
+        ),
     }
+
+
+def representation_hours(kind: str, groups: dict[str, Any]) -> dict[str, float]:
+    estimates: Counter[str] = Counter()
+    for name, group in groups.items():
+        hours = group["duration"]["estimated_hours"]
+        if hours is None:
+            continue
+        representation = name.split("/", 1)[0] if kind == "librilight" else "audio"
+        estimates[representation] += hours
+    return dict(estimates)
+
+
+def corpus_hours(kind: str, groups: dict[str, Any]) -> float | None:
+    estimates = representation_hours(kind, groups)
+    if not estimates:
+        return None
+    if kind != "librilight":
+        return sum(estimates.values())
+    if "raw" in estimates:
+        return estimates["raw"]
+    if "vad" in estimates:
+        return estimates["vad"]
+    return sum(estimates.values())
 
 
 def combined_report(librispeech: dict[str, Any], librilight: dict[str, Any]) -> dict[str, Any]:

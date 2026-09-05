@@ -139,6 +139,7 @@ def test_inspect_libriheavy_lhotse_manifest(tmp_path: Path) -> None:
 
 
 def test_inspect_librispeech_and_librilight(tmp_path: Path) -> None:
+    import json
     import wave
 
     def write_wav(path: Path, seconds: int) -> None:
@@ -176,3 +177,28 @@ def test_inspect_librispeech_and_librilight(tmp_path: Path) -> None:
     light_group = librilight["groups"]["small"]
     assert light_group["duration"]["sample_rate_counts"] == {16000: 1}
     assert light_group["duration"]["estimated_hours"] == 3 / 3600
+
+    processed_root = tmp_path / "processed-librilight"
+    raw = processed_root / "raw" / "large" / "100" / "book"
+    vad = processed_root / "vad" / "large" / "100" / "123"
+    write_wav(raw / "recording.wav", 4)
+    (raw / "recording.json").write_text(
+        json.dumps({"speaker": "100", "book": "book", "sample_rate": 16000}),
+        encoding="utf-8",
+    )
+    write_wav(vad / "recording_0000.wav", 4)
+    processed = inspect_corpus("librilight", processed_root, 100, 10)
+    assert processed["status"] == "PASS"
+    assert processed["recognized_top_level_groups"] == ["raw", "vad"]
+    assert processed["groups"]["raw/large"]["unique_speakers"] == 1
+    assert processed["groups"]["vad/large"]["unique_speakers"] == 1
+    assert processed["groups"]["raw/large"]["json_metadata"]["top_level_key_counts"] == {
+        "speaker": 1,
+        "book": 1,
+        "sample_rate": 1,
+    }
+    assert processed["representation_estimated_hours"] == {
+        "raw": 4 / 3600,
+        "vad": 4 / 3600,
+    }
+    assert processed["estimated_hours"] == 4 / 3600
