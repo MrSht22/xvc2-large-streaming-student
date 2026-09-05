@@ -3,6 +3,7 @@ from pathlib import Path
 import torch
 
 from xvc2_student.audit import audit_manifests
+from xvc2_student.build_audio_manifest import build_manifests
 from xvc2_student.checkpoint import load_checkpoint, save_checkpoint
 from xvc2_student.config import ExperimentConfig
 from xvc2_student.env_check import version_tuple
@@ -202,3 +203,80 @@ def test_inspect_librispeech_and_librilight(tmp_path: Path) -> None:
         "vad": 4 / 3600,
     }
     assert processed["estimated_hours"] == 4 / 3600
+
+
+def test_build_codec_audio_manifests(tmp_path: Path) -> None:
+    import json
+    import wave
+
+    def write_wav(path: Path, seconds: int) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(path), "wb") as stream:
+            stream.setnchannels(1)
+            stream.setsampwidth(2)
+            stream.setframerate(16_000)
+            stream.writeframes(b"\x00\x00" * 16_000 * seconds)
+
+    def add_librispeech(split: str, speaker: str) -> None:
+        chapter = "10"
+        utterance = f"{speaker}-{chapter}-0000"
+        directory = tmp_path / "LibriSpeech" / split / speaker / chapter
+        write_wav(directory / f"{utterance}.wav", 1)
+        (directory / f"{speaker}-{chapter}.trans.txt").write_text(
+            f"{utterance} TEST TRANSCRIPT\n", encoding="utf-8"
+        )
+
+    for split, speaker in (
+        ("train-clean-100", "1"),
+        ("train-clean-360", "2"),
+        ("train-other-500", "3"),
+        ("dev-clean", "4"),
+        ("dev-other", "5"),
+        ("test-clean", "6"),
+        ("test-other", "7"),
+    ):
+        add_librispeech(split, speaker)
+
+    librilight = tmp_path / "LibriLight"
+    raw = librilight / "raw" / "small" / "8" / "book"
+    raw.mkdir(parents=True)
+    (raw / "recording.json").write_text(
+        json.dumps(
+            {
+                "speaker": "8",
+                "snr": 12.0,
+                "voice_activity": [[0.0, 4.0]],
+                "book_meta": {"id": 20, "language": "English"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    write_wav(librilight / "vad" / "small" / "8" / "20" / "recording_0000.wav", 4)
+
+    output = tmp_path / "output"
+    report = build_manifests(
+        tmp_path / "LibriSpeech",
+        librilight,
+        output,
+        target_train_hours=7 / 3600,
+        librilight_subsets=("small",),
+        minimum_duration=1.0,
+        maximum_duration=10.0,
+        minimum_snr=8.0,
+        maximum_speaker_hours=1.0,
+        seed=1,
+    )
+    assert report["status"] == "PASS"
+    assert report["splits"]["train"]["items"] == 4
+    assert report["splits"]["validation"]["items"] == 2
+    assert report["splits"]["test"]["items"] == 2
+    assert report["target_overshoot_seconds"] == 0
+    assert report["split_integrity"]["train_heldout_speaker_leakage"] == []
+    train_rows = [
+        json.loads(line) for line in (output / "train_audio.jsonl").read_text().splitlines()
+    ]
+    light_row = next(row for row in train_rows if row["corpus"] == "librilight")
+    assert light_row["snr"] == 12.0
+    assert light_row["raw_recording_id"] == "recording"
+    assert (output / "validation_audio.jsonl").is_file()
+    assert (output / "test_audio.jsonl").is_file()

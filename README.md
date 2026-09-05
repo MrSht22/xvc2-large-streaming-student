@@ -109,6 +109,37 @@ split 默认只随机抽样 500 个音频 header 来估算时长，不解码波�
 若 LibriLight 同时包含 `raw/` 长录音和 `vad/` 切段，报告会把它们视为同一语料的两种
 representation，分别统计但不会相加为总时长；伴随 raw 音频的 JSON 会抽样解析字段结构。
 
+### 构建 5,000 小时 Codec 音频选择清单
+
+结构检查通过后，使用 LibriSpeech 三个 train split，加上经过 raw JSON SNR 映射的
+LibriLight `vad/small` 与 `vad/medium`，累计到至少 5,000 小时：
+
+```bash
+OUT="$PWD/runs/codec-audio-5000h-v1"
+mkdir -p "$OUT"
+
+PYTHONPATH=src python -m xvc2_student.build_audio_manifest \
+  --librispeech-root /absolute/path/to/LibriSpeech \
+  --librilight-root /absolute/path/to/LibriLight \
+  --output-dir "$OUT" \
+  --target-train-hours 5000 \
+  --librilight-subset small \
+  --librilight-subset medium \
+  --min-duration-seconds 3.2 \
+  --max-duration-seconds 120 \
+  --min-snr 8 \
+  --max-librilight-hours-per-speaker 20 \
+  --seed 1 \
+  2>&1 | tee "$OUT/run.log"
+```
+
+构建器读取所有入选候选的音频 header，因此这里的小时数是精确求和，不是检查器的抽样估算；
+最终总量最多比目标多一个 VAD 切段，超出秒数写入 `report.json`。
+它输出 `train_audio.jsonl`、`validation_audio.jsonl`、`test_audio.jsonl`、`report.json` 和
+`report.md`。LibriSpeech dev/test speaker 会从 LibriLight train 中排除。输出是后续提取
+Student hidden、speaker target 和可选 anchor 的 source-audio selection manifest；尚不是
+可直接交给 Codec DataLoader 的 cache manifest。
+
 ```bash
 xvc2-student-audit manifest \
   --manifest train=/path/train.jsonl \
