@@ -331,11 +331,11 @@ def total_seconds(rows: list[dict[str, Any]]) -> float:
 
 def select_librilight(
     candidates: list[dict[str, Any]],
-    target_seconds: float,
+    target_seconds: float | None,
     maximum_speaker_seconds: float,
     seed: int,
     excluded_speakers: set[str] | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     speaker_seconds: Counter[str] = Counter()
     counters: Counter[str] = Counter()
@@ -355,16 +355,20 @@ def select_librilight(
         selected.append(row)
         speaker_seconds[speaker] += duration
         selected_seconds += duration
-        if selected_seconds >= target_seconds:
+        if target_seconds is not None and selected_seconds >= target_seconds:
             break
-    if selected_seconds < target_seconds:
+    if target_seconds is not None and selected_seconds < target_seconds:
         raise RuntimeError(
             f"Only selected {selected_seconds / 3600:.2f}h of requested "
             f"{target_seconds / 3600:.2f}h LibriLight"
         )
     counters["selected_items"] = len(selected)
     counters["selected_speakers"] = len(speaker_seconds)
-    return selected, dict(counters)
+    return selected, {
+        **dict(counters),
+        "selection_mode": "target_hours" if target_seconds is not None else "all_eligible",
+        "selected_hours": selected_seconds / 3600,
+    }
 
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -400,13 +404,21 @@ def split_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def markdown_report(report: dict[str, Any]) -> str:
+    target_train_hours = report["configuration"]["target_train_hours"]
+    if target_train_hours is None:
+        target_lines = ["- Selection mode: all eligible audio within the speaker cap"]
+    else:
+        target_lines = [
+            "- Selection mode: target hours",
+            f"- Target train hours: {target_train_hours:.2f}",
+            f"- Target overshoot: {report['target_overshoot_seconds']:.2f} seconds",
+        ]
     lines = [
         "# Codec Audio Manifest Selection",
         "",
         f"- Status: **{report['status']}**",
-        f"- Target train hours: {report['configuration']['target_train_hours']:.2f}",
+        *target_lines,
         f"- Actual train hours: {report['splits']['train']['hours']:.2f}",
-        f"- Target overshoot: {report['target_overshoot_seconds']:.2f} seconds",
         f"- LibriLight subsets: {', '.join(report['configuration']['librilight_subsets'])}",
         f"- Minimum SNR: {report['configuration']['minimum_snr']:.2f} dB",
         "",
@@ -432,7 +444,7 @@ def build_manifests(
     librispeech_root: Path,
     librilight_root: Path,
     output_dir: Path,
-    target_train_hours: float,
+    target_train_hours: float | None,
     librilight_subsets: tuple[str, ...],
     minimum_duration: float,
     maximum_duration: float,
@@ -464,8 +476,8 @@ def build_manifests(
         for row in collect_librispeech_split(librispeech_root, split, progress, num_workers)
     ]
     librispeech_seconds = total_seconds(train_librispeech)
-    target_seconds = target_train_hours * 3600
-    if librispeech_seconds >= target_seconds:
+    target_seconds = target_train_hours * 3600 if target_train_hours is not None else None
+    if target_seconds is not None and librispeech_seconds >= target_seconds:
         raise ValueError("Target train hours must exceed LibriSpeech train hours")
     print(f"collecting_librilight_candidates num_workers={num_workers}", flush=True)
     candidates, candidate_report = collect_librilight_candidates(
@@ -478,9 +490,12 @@ def build_manifests(
         num_workers,
     )
     heldout_speakers = {str(row["speaker_id"]) for row in validation + test}
+    librilight_target_seconds = (
+        target_seconds - librispeech_seconds if target_seconds is not None else None
+    )
     selected_librilight, selection_counts = select_librilight(
         candidates,
-        target_seconds - librispeech_seconds,
+        librilight_target_seconds,
         maximum_speaker_hours * 3600,
         seed,
         heldout_speakers,
@@ -507,6 +522,11 @@ def build_manifests(
             "librispeech_root": str(librispeech_root),
             "librilight_root": str(librilight_root),
             "target_train_hours": target_train_hours,
+            "selection_mode": (
+                "target_hours"
+                if target_train_hours is not None
+                else "all_eligible_with_speaker_cap"
+            ),
             "librilight_subsets": list(librilight_subsets),
             "minimum_duration_seconds": minimum_duration,
             "maximum_duration_seconds": maximum_duration,
@@ -526,7 +546,9 @@ def build_manifests(
             "validation": split_summary(validation),
             "test": split_summary(test),
         },
-        "target_overshoot_seconds": total_seconds(train) - target_seconds,
+        "target_overshoot_seconds": (
+            total_seconds(train) - target_seconds if target_seconds is not None else None
+        ),
         "output_paths": {name: str(path) for name, path in paths.items()},
         "status": "PASS",
     }
@@ -544,19 +566,18 @@ def main() -> None:
     parser.add_argument("--librispeech-root", type=Path, required=True)
     parser.add_argument("--librilight-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--target-train-hours", type=float, default=5_000)
+    parser.add_argument("--target-train-hours", type=float)
     parser.add_argument("--librilight-subset", action="append", default=[])
     parser.add_argument("--min-duration-seconds", type=float, default=3.2)
     parser.add_argument("--max-duration-seconds", type=float, default=120.0)
     parser.add_argument("--min-snr", type=float, default=8.0)
-    parser.add_argument("--max-librilight-hours-per-speaker", type=float, default=20.0)
+    parser.add_argument("--max-librilight-hours-per-speaker", type=float, default=30.0)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=1)
     args = parser.parse_args()
     subsets = tuple(args.librilight_subset or ["small", "medium"])
     if (
         min(
-            args.target_train_hours,
             args.min_duration_seconds,
             args.max_duration_seconds,
             args.max_librilight_hours_per_speaker,
@@ -564,6 +585,8 @@ def main() -> None:
         <= 0
     ):
         parser.error("hours and duration limits must be positive")
+    if args.target_train_hours is not None and args.target_train_hours <= 0:
+        parser.error("target train hours must be positive")
     if args.min_duration_seconds > args.max_duration_seconds:
         parser.error("minimum duration cannot exceed maximum duration")
     if args.num_workers < 1:

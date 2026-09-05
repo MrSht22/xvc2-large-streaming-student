@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 
 from xvc2_student.audit import audit_manifests
-from xvc2_student.build_audio_manifest import build_manifests
+from xvc2_student.build_audio_manifest import build_manifests, select_librilight
 from xvc2_student.checkpoint import load_checkpoint, save_checkpoint
 from xvc2_student.config import ExperimentConfig
 from xvc2_student.env_check import version_tuple
@@ -301,3 +301,43 @@ def test_build_codec_audio_manifests(tmp_path: Path, capsys) -> None:
     assert light_rows["second"]["snr"] == 18.0
     assert (output / "validation_audio.jsonl").is_file()
     assert (output / "test_audio.jsonl").is_file()
+
+    all_output = tmp_path / "all-output"
+    all_report = build_manifests(
+        tmp_path / "LibriSpeech",
+        librilight,
+        all_output,
+        target_train_hours=None,
+        librilight_subsets=("small",),
+        minimum_duration=1.0,
+        maximum_duration=10.0,
+        minimum_snr=8.0,
+        maximum_speaker_hours=1.0,
+        seed=1,
+        num_workers=2,
+    )
+    assert all_report["configuration"]["selection_mode"] == "all_eligible_with_speaker_cap"
+    assert all_report["target_overshoot_seconds"] is None
+    assert all_report["splits"]["train"]["items"] == 5
+    assert "all eligible audio" in (all_output / "report.md").read_text(encoding="utf-8")
+
+
+def test_select_all_librilight_with_speaker_cap() -> None:
+    candidates = [
+        {"utterance_id": "a", "speaker_id": "1", "duration_seconds": 4.0},
+        {"utterance_id": "b", "speaker_id": "1", "duration_seconds": 4.0},
+        {"utterance_id": "c", "speaker_id": "1", "duration_seconds": 4.0},
+        {"utterance_id": "d", "speaker_id": "2", "duration_seconds": 3.0},
+    ]
+    selected, counts = select_librilight(
+        candidates,
+        target_seconds=None,
+        maximum_speaker_seconds=10.0,
+        seed=1,
+    )
+    selected_speaker_one = [row for row in selected if row["speaker_id"] == "1"]
+    assert len(selected_speaker_one) == 2
+    assert sum(row["duration_seconds"] for row in selected_speaker_one) == 8.0
+    assert {row["utterance_id"] for row in selected if row["speaker_id"] == "2"} == {"d"}
+    assert counts["selection_mode"] == "all_eligible"
+    assert counts["skipped_speaker_cap"] == 1
