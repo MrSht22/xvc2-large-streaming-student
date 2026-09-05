@@ -7,6 +7,9 @@ import random
 import re
 import sys
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from itertools import islice
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -18,6 +21,7 @@ LIBRISPEECH_TRAIN_SPLITS = ("train-clean-100", "train-clean-360", "train-other-5
 LIBRISPEECH_VALIDATION_SPLITS = ("dev-clean", "dev-other")
 LIBRISPEECH_TEST_SPLITS = ("test-clean", "test-other")
 SEGMENT_SUFFIX = re.compile(r"_\d+$")
+METADATA_BATCH_SIZE = 2_048
 
 
 def iter_audio_files(root: Path) -> Iterator[Path]:
@@ -27,6 +31,24 @@ def iter_audio_files(root: Path) -> Iterator[Path]:
             path = Path(directory) / filename
             if path.suffix.lower() in AUDIO_SUFFIXES:
                 yield path
+
+
+def batched(items: Iterator[Any], size: int = METADATA_BATCH_SIZE) -> Iterator[list[Any]]:
+    while batch := list(islice(items, size)):
+        yield batch
+
+
+def map_audio_metadata(paths: list[Path], executor: ThreadPoolExecutor | None) -> list[Any]:
+    if executor is None:
+        return [audio_metadata(path) for path in paths]
+    return list(executor.map(audio_metadata, paths))
+
+
+def safe_audio_metadata(path: Path) -> dict[str, Any] | None:
+    try:
+        return audio_metadata(path)
+    except Exception:  # pragma: no cover - backend and file dependent
+        return None
 
 
 def load_chapter_transcripts(directory: Path) -> dict[str, str]:
@@ -43,41 +65,59 @@ def load_chapter_transcripts(directory: Path) -> dict[str, str]:
     return transcripts
 
 
-def collect_librispeech_split(root: Path, split: str, progress: bool) -> list[dict[str, Any]]:
+def collect_librispeech_split(
+    root: Path, split: str, progress: bool, num_workers: int
+) -> list[dict[str, Any]]:
     split_root = root / split
     if not split_root.is_dir():
         raise NotADirectoryError(split_root)
     rows: list[dict[str, Any]] = []
-    transcript_cache: dict[Path, dict[str, str]] = {}
-    for index, path in enumerate(iter_audio_files(split_root), 1):
-        relative_path = path.relative_to(split_root)
-        if len(relative_path.parts) < 3:
-            raise ValueError(f"Unexpected LibriSpeech path: {path}")
-        speaker_id, chapter_id = relative_path.parts[:2]
-        if path.parent not in transcript_cache:
-            transcript_cache[path.parent] = load_chapter_transcripts(path.parent)
-        transcripts = transcript_cache[path.parent]
-        utterance_id = path.stem
-        if utterance_id not in transcripts:
-            raise ValueError(f"Missing transcript for {path}")
-        metadata = audio_metadata(path)
-        rows.append(
-            {
-                "utterance_id": f"librispeech/{split}/{utterance_id}",
-                "corpus": "librispeech",
-                "subset": split,
-                "speaker_id": speaker_id,
-                "chapter_or_book_id": chapter_id,
-                "audio_path": str(path.resolve()),
-                "sample_rate": metadata["sample_rate"],
-                "channels": metadata["channels"],
-                "num_frames": metadata["num_frames"],
-                "duration_seconds": metadata["duration_seconds"],
-                "text": transcripts[utterance_id],
-            }
-        )
-        if progress and index % 50_000 == 0:
-            print(f"librispeech_{split}_audio={index}", file=sys.stderr, flush=True)
+    current_directory: Path | None = None
+    transcripts: dict[str, str] = {}
+
+    def items() -> Iterator[tuple[Path, str, str, str, str]]:
+        nonlocal current_directory, transcripts
+        for path in iter_audio_files(split_root):
+            relative_path = path.relative_to(split_root)
+            if len(relative_path.parts) < 3:
+                raise ValueError(f"Unexpected LibriSpeech path: {path}")
+            speaker_id, chapter_id = relative_path.parts[:2]
+            if path.parent != current_directory:
+                current_directory = path.parent
+                transcripts = load_chapter_transcripts(path.parent)
+            utterance_id = path.stem
+            if utterance_id not in transcripts:
+                raise ValueError(f"Missing transcript for {path}")
+            yield path, speaker_id, chapter_id, utterance_id, transcripts[utterance_id]
+
+    index = 0
+    executor_context = (
+        ThreadPoolExecutor(max_workers=num_workers) if num_workers > 1 else nullcontext(None)
+    )
+    with executor_context as executor:
+        for batch in batched(items()):
+            metadata_batch = map_audio_metadata([item[0] for item in batch], executor)
+            for (path, speaker_id, chapter_id, utterance_id, text), metadata in zip(
+                batch, metadata_batch, strict=True
+            ):
+                index += 1
+                rows.append(
+                    {
+                        "utterance_id": f"librispeech/{split}/{utterance_id}",
+                        "corpus": "librispeech",
+                        "subset": split,
+                        "speaker_id": speaker_id,
+                        "chapter_or_book_id": chapter_id,
+                        "audio_path": str(path.resolve()),
+                        "sample_rate": metadata["sample_rate"],
+                        "channels": metadata["channels"],
+                        "num_frames": metadata["num_frames"],
+                        "duration_seconds": metadata["duration_seconds"],
+                        "text": text,
+                    }
+                )
+                if progress and index % 50_000 == 0:
+                    print(f"librispeech_{split}_audio={index}", file=sys.stderr, flush=True)
     return rows
 
 
@@ -136,11 +176,13 @@ def collect_librilight_candidates(
     maximum_duration: float,
     minimum_snr: float,
     progress: bool,
+    num_workers: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     exact, fallback = raw_metadata_index(root, subsets, progress)
     candidates: list[dict[str, Any]] = []
     counters: Counter[str] = Counter()
     subset_seconds: Counter[str] = Counter()
+    pending: list[tuple[Path, str, str, str, dict[str, Any]]] = []
     for subset in subsets:
         subset_root = root / "vad" / subset
         if not subset_root.is_dir():
@@ -166,48 +208,63 @@ def collect_librilight_candidates(
             if snr < minimum_snr:
                 counters["rejected_low_snr"] += 1
                 continue
-            try:
-                metadata = audio_metadata(path)
-            except Exception:  # pragma: no cover - backend and file dependent
-                counters["rejected_audio_metadata"] += 1
-                continue
-            duration = metadata["duration_seconds"]
-            if metadata["sample_rate"] != 16_000:
-                counters["rejected_sample_rate"] += 1
-                continue
-            if metadata["channels"] != 1:
-                counters["rejected_channels"] += 1
-                continue
-            if duration < minimum_duration:
-                counters["rejected_too_short"] += 1
-                continue
-            if duration > maximum_duration:
-                counters["rejected_too_long"] += 1
-                continue
-            row = {
-                "utterance_id": f"librilight/vad/{subset}/{speaker_id}/{book_id}/{path.stem}",
-                "corpus": "librilight",
-                "subset": f"vad/{subset}",
-                "speaker_id": speaker_id,
-                "chapter_or_book_id": book_id,
-                "audio_path": str(path.resolve()),
-                "sample_rate": metadata["sample_rate"],
-                "channels": metadata["channels"],
-                "num_frames": metadata["num_frames"],
-                "duration_seconds": duration,
-                "snr": snr,
-                "raw_recording_id": source["raw_recording_id"],
-                "raw_metadata_path": source["raw_metadata_path"],
-            }
-            candidates.append(row)
-            counters["accepted_candidates"] += 1
-            subset_seconds[subset] += duration
-            if progress and counters["audio_files_seen"] % 50_000 == 0:
-                print(
-                    f"librilight_vad_seen={counters['audio_files_seen']},accepted={len(candidates)}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+            pending.append((path, subset, speaker_id, book_id, source))
+
+    processed = 0
+    executor_context = (
+        ThreadPoolExecutor(max_workers=num_workers) if num_workers > 1 else nullcontext(None)
+    )
+    with executor_context as executor:
+        for batch in batched(iter(pending)):
+            paths = [item[0] for item in batch]
+            if executor is None:
+                metadata_batch = [safe_audio_metadata(path) for path in paths]
+            else:
+                metadata_batch = list(executor.map(safe_audio_metadata, paths))
+            for (path, subset, speaker_id, book_id, source), metadata in zip(
+                batch, metadata_batch, strict=True
+            ):
+                processed += 1
+                if metadata is None:
+                    counters["rejected_audio_metadata"] += 1
+                    continue
+                duration = metadata["duration_seconds"]
+                if metadata["sample_rate"] != 16_000:
+                    counters["rejected_sample_rate"] += 1
+                    continue
+                if metadata["channels"] != 1:
+                    counters["rejected_channels"] += 1
+                    continue
+                if duration < minimum_duration:
+                    counters["rejected_too_short"] += 1
+                    continue
+                if duration > maximum_duration:
+                    counters["rejected_too_long"] += 1
+                    continue
+                row = {
+                    "utterance_id": f"librilight/vad/{subset}/{speaker_id}/{book_id}/{path.stem}",
+                    "corpus": "librilight",
+                    "subset": f"vad/{subset}",
+                    "speaker_id": speaker_id,
+                    "chapter_or_book_id": book_id,
+                    "audio_path": str(path.resolve()),
+                    "sample_rate": metadata["sample_rate"],
+                    "channels": metadata["channels"],
+                    "num_frames": metadata["num_frames"],
+                    "duration_seconds": duration,
+                    "snr": source["snr"],
+                    "raw_recording_id": source["raw_recording_id"],
+                    "raw_metadata_path": source["raw_metadata_path"],
+                }
+                candidates.append(row)
+                counters["accepted_candidates"] += 1
+                subset_seconds[subset] += duration
+                if progress and processed % 50_000 == 0:
+                    print(
+                        f"librilight_metadata_processed={processed},accepted={len(candidates)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
     return candidates, {
         "counts": dict(counters),
         "accepted_candidate_hours_by_subset": {
@@ -333,6 +390,7 @@ def build_manifests(
     maximum_speaker_hours: float,
     seed: int,
     progress: bool = False,
+    num_workers: int = 1,
 ) -> dict[str, Any]:
     librispeech_root = librispeech_root.expanduser().resolve()
     librilight_root = librilight_root.expanduser().resolve()
@@ -341,19 +399,19 @@ def build_manifests(
     train_librispeech = [
         row
         for split in LIBRISPEECH_TRAIN_SPLITS
-        for row in collect_librispeech_split(librispeech_root, split, progress)
+        for row in collect_librispeech_split(librispeech_root, split, progress, num_workers)
     ]
     print("collecting_librispeech_validation", flush=True)
     validation = [
         row
         for split in LIBRISPEECH_VALIDATION_SPLITS
-        for row in collect_librispeech_split(librispeech_root, split, progress)
+        for row in collect_librispeech_split(librispeech_root, split, progress, num_workers)
     ]
     print("collecting_librispeech_test", flush=True)
     test = [
         row
         for split in LIBRISPEECH_TEST_SPLITS
-        for row in collect_librispeech_split(librispeech_root, split, progress)
+        for row in collect_librispeech_split(librispeech_root, split, progress, num_workers)
     ]
     librispeech_seconds = total_seconds(train_librispeech)
     target_seconds = target_train_hours * 3600
@@ -367,6 +425,7 @@ def build_manifests(
         maximum_duration,
         minimum_snr,
         progress,
+        num_workers,
     )
     heldout_speakers = {str(row["speaker_id"]) for row in validation + test}
     selected_librilight, selection_counts = select_librilight(
@@ -404,6 +463,7 @@ def build_manifests(
             "minimum_snr": minimum_snr,
             "maximum_librilight_hours_per_speaker": maximum_speaker_hours,
             "seed": seed,
+            "num_workers": num_workers,
         },
         "candidate_filter": candidate_report,
         "selection_counts": selection_counts,
@@ -441,6 +501,7 @@ def main() -> None:
     parser.add_argument("--min-snr", type=float, default=8.0)
     parser.add_argument("--max-librilight-hours-per-speaker", type=float, default=20.0)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=1)
     args = parser.parse_args()
     subsets = tuple(args.librilight_subset or ["small", "medium"])
     if (
@@ -455,6 +516,8 @@ def main() -> None:
         parser.error("hours and duration limits must be positive")
     if args.min_duration_seconds > args.max_duration_seconds:
         parser.error("minimum duration cannot exceed maximum duration")
+    if args.num_workers < 1:
+        parser.error("num-workers must be at least 1")
     report = build_manifests(
         args.librispeech_root,
         args.librilight_root,
@@ -467,6 +530,7 @@ def main() -> None:
         args.max_librilight_hours_per_speaker,
         args.seed,
         progress=True,
+        num_workers=args.num_workers,
     )
     print(json.dumps({"status": report["status"], **report["splits"]}, sort_keys=True))
     print(f"report_json={args.output_dir.expanduser().resolve() / 'report.json'}")

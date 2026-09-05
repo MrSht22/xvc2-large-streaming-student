@@ -251,32 +251,48 @@ def test_build_codec_audio_manifests(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
+    (raw / "second.json").write_text(
+        json.dumps(
+            {
+                "speaker": "8",
+                "snr": 18.0,
+                "voice_activity": [[0.0, 4.0]],
+                "book_meta": {"id": 20, "language": "English"},
+            }
+        ),
+        encoding="utf-8",
+    )
     write_wav(librilight / "vad" / "small" / "8" / "20" / "recording_0000.wav", 4)
+    write_wav(librilight / "vad" / "small" / "8" / "20" / "second_0000.wav", 4)
 
     output = tmp_path / "output"
     report = build_manifests(
         tmp_path / "LibriSpeech",
         librilight,
         output,
-        target_train_hours=7 / 3600,
+        target_train_hours=11 / 3600,
         librilight_subsets=("small",),
         minimum_duration=1.0,
         maximum_duration=10.0,
         minimum_snr=8.0,
         maximum_speaker_hours=1.0,
         seed=1,
+        num_workers=2,
     )
     assert report["status"] == "PASS"
-    assert report["splits"]["train"]["items"] == 4
+    assert report["splits"]["train"]["items"] == 5
     assert report["splits"]["validation"]["items"] == 2
     assert report["splits"]["test"]["items"] == 2
     assert report["target_overshoot_seconds"] == 0
+    assert report["configuration"]["num_workers"] == 2
     assert report["split_integrity"]["train_heldout_speaker_leakage"] == []
     train_rows = [
         json.loads(line) for line in (output / "train_audio.jsonl").read_text().splitlines()
     ]
-    light_row = next(row for row in train_rows if row["corpus"] == "librilight")
-    assert light_row["snr"] == 12.0
-    assert light_row["raw_recording_id"] == "recording"
+    light_rows = {
+        row["raw_recording_id"]: row for row in train_rows if row["corpus"] == "librilight"
+    }
+    assert light_rows["recording"]["snr"] == 12.0
+    assert light_rows["second"]["snr"] == 18.0
     assert (output / "validation_audio.jsonl").is_file()
     assert (output / "test_audio.jsonl").is_file()
