@@ -4,12 +4,16 @@ import argparse
 import functools
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import sys
 import tempfile
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
+from itertools import islice
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -20,6 +24,7 @@ WORD_PATTERN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
 STRESS_PATTERN = re.compile(r"\d")
 DEFAULT_TARGET_TRAIN_HOURS = 5_000.0
 DEFAULT_MAXIMUM_SPEAKER_HOURS = 30.0
+PHONE_BATCH_SIZE = 1_024
 CODEC_FILENAMES = {
     "train": "train_audio.jsonl",
     "validation": "validation_audio.jsonl",
@@ -65,12 +70,19 @@ def create_g2p_fallback(enabled: bool):
 
 
 class PhoneConverter:
-    def __init__(self, vocabulary: dict[str, int], g2p_fallback: bool) -> None:
-        try:
-            import cmudict
-        except ImportError as error:
-            raise RuntimeError("Install cmudict before building Student manifests") from error
-        self.pronunciations = cmudict.dict()
+    def __init__(
+        self,
+        vocabulary: dict[str, int],
+        g2p_fallback: bool,
+        pronunciations: dict[str, list[list[str]]] | None = None,
+    ) -> None:
+        if pronunciations is None:
+            try:
+                import cmudict
+            except ImportError as error:
+                raise RuntimeError("Install cmudict before building Student manifests") from error
+            pronunciations = cmudict.dict()
+        self.pronunciations = pronunciations
         self.vocabulary = vocabulary
         self.g2p = create_g2p_fallback(g2p_fallback)
 
@@ -102,6 +114,67 @@ class PhoneConverter:
                     return None, f"phone_not_in_teacher_vocab:{phone}", fallback_words
                 phone_ids.append(self.vocabulary[phone])
         return phone_ids, None, fallback_words
+
+
+_PHONE_WORKER: PhoneConverter | None = None
+
+
+def initialize_phone_worker(
+    vocabulary: dict[str, int],
+    g2p_fallback: bool,
+    pronunciations: dict[str, list[list[str]]] | None,
+) -> None:
+    global _PHONE_WORKER
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    _PHONE_WORKER = PhoneConverter(vocabulary, g2p_fallback, pronunciations)
+
+
+def convert_phone_worker(text: str) -> tuple[list[int] | None, str | None, int]:
+    if _PHONE_WORKER is None:  # pragma: no cover - executor contract
+        raise RuntimeError("Phone worker was not initialized")
+    return _PHONE_WORKER.convert(text)
+
+
+class PhoneConversionPool:
+    def __init__(
+        self,
+        vocabulary: dict[str, int],
+        g2p_fallback: bool,
+        num_workers: int,
+        local_converter: PhoneConverter | None = None,
+        pronunciations: dict[str, list[list[str]]] | None = None,
+    ) -> None:
+        self.num_workers = num_workers
+        self.local_converter = local_converter or PhoneConverter(
+            vocabulary, g2p_fallback, pronunciations
+        )
+        self.executor = (
+            ProcessPoolExecutor(
+                max_workers=num_workers,
+                mp_context=get_context("spawn"),
+                initializer=initialize_phone_worker,
+                initargs=(vocabulary, g2p_fallback, pronunciations),
+            )
+            if num_workers > 1
+            else None
+        )
+
+    def convert_many(self, texts: list[str]) -> list[tuple[list[int] | None, str | None, int]]:
+        if self.executor is None:
+            return [self.local_converter.convert(text) for text in texts]
+        chunksize = max(1, len(texts) // (self.num_workers * 4))
+        return list(self.executor.map(convert_phone_worker, texts, chunksize=chunksize))
+
+    def close(self) -> None:
+        if self.executor is not None:
+            self.executor.shutdown(wait=True, cancel_futures=True)
+
+    def __enter__(self) -> PhoneConversionPool:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 @dataclass
@@ -360,10 +433,10 @@ def index_libriheavy_candidates(
 
 
 def convert_librispeech_row(
-    row: dict[str, Any], converter: PhoneConverter
+    row: dict[str, Any], conversion: tuple[list[int] | None, str | None, int]
 ) -> tuple[dict[str, Any] | None, str | None, int]:
     text = " ".join(str(row["text"]).split())
-    phone_ids, error, fallback_words = converter.convert(text)
+    phone_ids, error, fallback_words = conversion
     if error:
         return None, error, fallback_words
     result = dict(row)
@@ -403,10 +476,11 @@ def finalize_summary(summary: dict[str, Any]) -> dict[str, Any]:
 def write_student_manifests(
     connection: sqlite3.Connection,
     codec_rows: dict[str, list[dict[str, Any]]],
-    converter: PhoneConverter,
+    converter: PhoneConversionPool,
     output_dir: Path,
     target_train_hours: float | None,
     maximum_speaker_hours: float,
+    progress: bool,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     output_paths = {split: output_dir / f"{split}.jsonl" for split in CODEC_FILENAMES}
     summaries = {split: empty_summary() for split in CODEC_FILENAMES}
@@ -418,14 +492,25 @@ def write_student_manifests(
     streams = {split: path.open("w", encoding="utf-8") for split, path in temporary_paths.items()}
     try:
         for split, rows in codec_rows.items():
-            for row in rows:
-                converted, error, row_fallback_words = convert_librispeech_row(row, converter)
-                fallback_words += row_fallback_words
-                if error:
-                    counters[f"{split}_librispeech_g2p_{error.split(':', 1)[0]}"] += 1
-                    continue
-                streams[split].write(json.dumps(converted, sort_keys=True) + "\n")
-                update_summary(summaries[split], converted)
+            for offset in range(0, len(rows), PHONE_BATCH_SIZE):
+                batch = rows[offset : offset + PHONE_BATCH_SIZE]
+                texts = [" ".join(str(row["text"]).split()) for row in batch]
+                conversions = converter.convert_many(texts)
+                for row, conversion in zip(batch, conversions, strict=True):
+                    converted, error, row_fallback_words = convert_librispeech_row(row, conversion)
+                    fallback_words += row_fallback_words
+                    if error:
+                        counters[f"{split}_librispeech_g2p_{error.split(':', 1)[0]}"] += 1
+                        continue
+                    streams[split].write(json.dumps(converted, sort_keys=True) + "\n")
+                    update_summary(summaries[split], converted)
+            if progress:
+                print(
+                    f"phone_labels split={split} processed={len(rows)} "
+                    f"accepted={summaries[split]['items']}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         target_seconds = target_train_hours * 3600 if target_train_hours is not None else None
         maximum_speaker_seconds = maximum_speaker_hours * 3600
@@ -433,25 +518,41 @@ def write_student_manifests(
         cursor = connection.execute(
             "SELECT payload FROM candidates ORDER BY priority, utterance_id"
         )
-        for (serialized,) in cursor:
+        stop = False
+        while not stop:
             if target_seconds is not None and summaries["train"]["seconds"] >= target_seconds:
                 break
-            row = json.loads(serialized)
-            duration = float(row["duration_seconds"])
-            speaker = str(row["speaker_id"])
-            if speaker_seconds[speaker] + duration > maximum_speaker_seconds:
-                counters["libriheavy_skipped_speaker_cap"] += 1
-                continue
-            phone_ids, error, row_fallback_words = converter.convert(row["normalized_text"])
-            fallback_words += row_fallback_words
-            if error:
-                counters[f"libriheavy_g2p_{error.split(':', 1)[0]}"] += 1
-                continue
-            row["phone_ids"] = phone_ids
-            streams["train"].write(json.dumps(row, sort_keys=True) + "\n")
-            update_summary(summaries["train"], row)
-            speaker_seconds[speaker] += duration
-            counters["libriheavy_selected_items"] += 1
+            serialized_batch = [item[0] for item in islice(cursor, PHONE_BATCH_SIZE)]
+            if not serialized_batch:
+                break
+            batch = [json.loads(serialized) for serialized in serialized_batch]
+            conversions = converter.convert_many([row["normalized_text"] for row in batch])
+            for row, (phone_ids, error, row_fallback_words) in zip(batch, conversions, strict=True):
+                fallback_words += row_fallback_words
+                if error:
+                    counters[f"libriheavy_g2p_{error.split(':', 1)[0]}"] += 1
+                    continue
+                duration = float(row["duration_seconds"])
+                speaker = str(row["speaker_id"])
+                if speaker_seconds[speaker] + duration > maximum_speaker_seconds:
+                    counters["libriheavy_skipped_speaker_cap"] += 1
+                    continue
+                row["phone_ids"] = phone_ids
+                streams["train"].write(json.dumps(row, sort_keys=True) + "\n")
+                update_summary(summaries["train"], row)
+                speaker_seconds[speaker] += duration
+                counters["libriheavy_selected_items"] += 1
+                if target_seconds is not None and summaries["train"]["seconds"] >= target_seconds:
+                    stop = True
+                    break
+            if progress and counters["libriheavy_selected_items"] % 50_000 < PHONE_BATCH_SIZE:
+                print(
+                    "phone_labels split=train corpus=libriheavy "
+                    f"selected={counters['libriheavy_selected_items']} "
+                    f"hours={summaries['train']['seconds'] / 3600:.2f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
     finally:
         for stream in streams.values():
             stream.close()
@@ -504,6 +605,7 @@ def build_student_manifests(
     text_source: str = "book",
     seed: int = 1,
     g2p_fallback: bool = True,
+    num_workers: int = 1,
     explicit_libriheavy_manifests: list[Path] | None = None,
     progress: bool = False,
 ) -> dict[str, Any]:
@@ -521,7 +623,7 @@ def build_student_manifests(
         else discover_libriheavy_manifests(libriheavy_root, subsets)
     )
     vocabulary = load_phone_vocabulary(vocabulary_path)
-    converter = PhoneConverter(vocabulary, g2p_fallback)
+    local_converter = PhoneConverter(vocabulary, g2p_fallback)
     with tempfile.NamedTemporaryFile(
         prefix="student-candidates-", suffix=".sqlite3", dir=output_dir, delete=False
     ) as temporary_database:
@@ -540,14 +642,21 @@ def build_student_manifests(
                 seed,
                 progress,
             )
-            splits, selection_counts = write_student_manifests(
-                connection,
-                codec_rows,
-                converter,
-                output_dir,
-                target_train_hours,
-                maximum_speaker_hours,
-            )
+            with PhoneConversionPool(
+                vocabulary,
+                g2p_fallback,
+                num_workers,
+                local_converter=local_converter,
+            ) as conversion_pool:
+                splits, selection_counts = write_student_manifests(
+                    connection,
+                    codec_rows,
+                    conversion_pool,
+                    output_dir,
+                    target_train_hours,
+                    maximum_speaker_hours,
+                    progress,
+                )
         finally:
             connection.close()
     finally:
@@ -579,6 +688,7 @@ def build_student_manifests(
             "text_source": text_source,
             "seed": seed,
             "g2p_fallback": g2p_fallback,
+            "num_workers": num_workers,
         },
         "codec_counts": codec_counts,
         "libriheavy_candidates": candidate_report,
@@ -639,6 +749,7 @@ def main() -> None:
     )
     parser.add_argument("--text-source", choices=("book", "asr", "supervision"), default="book")
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--disable-g2p-fallback", action="store_true")
     args = parser.parse_args()
     target_train_hours = None if args.all_matched else args.target_train_hours
@@ -646,6 +757,8 @@ def main() -> None:
         parser.error("target-train-hours must be positive")
     if args.max_librilight_hours_per_speaker <= 0:
         parser.error("max-librilight-hours-per-speaker must be positive")
+    if args.num_workers < 1:
+        parser.error("num-workers must be at least 1")
     report = build_student_manifests(
         args.codec_manifest_dir,
         args.libriheavy_root,
@@ -657,6 +770,7 @@ def main() -> None:
         args.text_source,
         args.seed,
         not args.disable_g2p_fallback,
+        args.num_workers,
         args.libriheavy_manifest,
         progress=True,
     )

@@ -167,6 +167,7 @@ PYTHONPATH=src python -m xvc2_student.build_student_manifest \
   --max-librilight-hours-per-speaker 30 \
   --text-source book \
   --seed 1 \
+  --num-workers 8 \
   2>&1 | tee "$OUT/run.log"
 ```
 
@@ -176,6 +177,10 @@ PYTHONPATH=src python -m xvc2_student.build_student_manifest \
 `train.jsonl`、`validation.jsonl`、`test.jsonl`、`report.json` 与 `report.md`。若有效匹配
 不足 5000 小时，已有结果仍会写出，但状态为 `NEEDS_ATTENTION`；使用 `--all-matched` 可取消
 固定总时长目标。
+
+`--num-workers` 使用多进程并行生成 CTC phone IDs；10 核节点建议设为 `8`，为 gzip 解压、
+SQLite 和主进程保留 2 核。LibriHeavy 扫描和最终写入保持单一确定顺序，因此 worker 数变化不会
+改变固定 seed 下的样本选择与 manifest 顺序。
 
 LibriHeavy 行指向 LibriLight raw 长录音，并保留 `start_seconds` 与 `duration_seconds`。
 当前 `PhoneManifestDataset` 尚未按这两个字段截取波形，因此这份 manifest 需要下一阶段的

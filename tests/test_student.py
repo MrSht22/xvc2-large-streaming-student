@@ -4,7 +4,7 @@ import torch
 
 from xvc2_student.audit import audit_manifests
 from xvc2_student.build_audio_manifest import build_manifests, select_librilight
-from xvc2_student.build_student_manifest import build_student_manifests
+from xvc2_student.build_student_manifest import PhoneConversionPool, build_student_manifests
 from xvc2_student.checkpoint import load_checkpoint, save_checkpoint
 from xvc2_student.config import ExperimentConfig
 from xvc2_student.env_check import version_tuple
@@ -100,6 +100,13 @@ def test_manifest_audit_counts_cut_duration(tmp_path: Path) -> None:
 
 def test_version_tuple() -> None:
     assert version_tuple("2.4.1+cu121") == (2, 4, 1)
+
+
+def test_package_lazy_exports() -> None:
+    import xvc2_student
+
+    assert xvc2_student.ExperimentConfig is ExperimentConfig
+    assert xvc2_student.StreamingPhoneEncoder is StreamingPhoneEncoder
 
 
 def test_teacher_loading_failures_reject_incomplete_checkpoint() -> None:
@@ -481,6 +488,7 @@ def test_build_student_manifests_from_codec_and_libriheavy(tmp_path: Path, monke
     )
 
     assert report["status"] == "PASS"
+    assert report["configuration"]["num_workers"] == 1
     assert report["codec_overlap"]["selected_recordings"] == 1
     assert report["codec_overlap"]["matched_recordings"] == 1
     assert report["codec_overlap"]["unmatched_recordings"] == 0
@@ -496,3 +504,23 @@ def test_build_student_manifests_from_codec_and_libriheavy(tmp_path: Path, monke
     assert heavy["phone_ids"]
     assert (output / "validation.jsonl").is_file()
     assert (output / "test.jsonl").is_file()
+
+
+def test_parallel_phone_conversion_preserves_order() -> None:
+    vocabulary = {"<pad>": 0, "T": 1, "EH": 2, "S": 3}
+    pronunciations = {
+        "test": [["T", "EH1", "S", "T"]],
+        "tests": [["T", "EH1", "S", "T", "S"]],
+    }
+    with PhoneConversionPool(
+        vocabulary,
+        g2p_fallback=False,
+        num_workers=2,
+        pronunciations=pronunciations,
+    ) as pool:
+        results = pool.convert_many(["TEST", "TESTS", "TEST"])
+    assert [result[0] for result in results] == [
+        [1, 2, 3, 1],
+        [1, 2, 3, 1, 3],
+        [1, 2, 3, 1],
+    ]
