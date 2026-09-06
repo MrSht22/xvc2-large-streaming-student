@@ -39,7 +39,11 @@ def identity(item: dict[str, Any]) -> tuple[str | None, str | None]:
     utterance_id = str(item.get("utterance_id", ""))
     parts = utterance_id.split("-")
     speaker = item.get("speaker_id") or (parts[0] if len(parts) >= 2 else None)
-    chapter = item.get("chapter_id") or (parts[1] if len(parts) >= 3 else None)
+    chapter = (
+        item.get("chapter_or_book_id")
+        or item.get("chapter_id")
+        or (parts[1] if len(parts) >= 3 else None)
+    )
     return (str(speaker) if speaker is not None else None, str(chapter) if chapter else None)
 
 
@@ -86,7 +90,15 @@ def audit_manifests(
             try:
                 sample_rate, num_frames = audio_metadata(audio_path)
                 sample_rates[sample_rate] += 1
-                seconds += num_frames / sample_rate
+                audio_seconds = num_frames / sample_rate
+                start_seconds = float(item.get("start_seconds", 0.0))
+                duration_seconds = float(item.get("duration_seconds", audio_seconds))
+                if start_seconds < 0 or duration_seconds <= 0:
+                    failures.append(f"{name}:{line_number}:invalid_segment")
+                elif start_seconds + duration_seconds > audio_seconds + 0.05:
+                    failures.append(f"{name}:{line_number}:segment_out_of_bounds")
+                else:
+                    seconds += duration_seconds
                 if num_frames <= 0:
                     failures.append(f"{name}:{line_number}:empty_audio")
             except Exception as error:

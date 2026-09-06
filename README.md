@@ -147,6 +147,40 @@ PYTHONPATH=src python -m xvc2_student.build_audio_manifest \
 Student hidden、speaker target 和可选 anchor 的 source-audio selection manifest；尚不是
 可直接交给 Codec DataLoader 的 cache manifest。
 
+### 构建 Student 蒸馏 Manifest
+
+Codec manifest 中的 LibriSpeech 已有 transcript，可以直接生成 Teacher 固定 40 类词表的
+`phone_ids`。LibriLight VAD 行没有 transcript，因此构建器先读取 Codec 选中的
+`subset/speaker/raw_recording_id`，再从 LibriHeavy cuts 中提取相同 raw recording 的文本切段：
+
+```bash
+CODEC_MANIFEST_DIR="$PWD/runs/codec-audio-all-cap30h-v1"
+OUT="$PWD/runs/student-manifest-5000h-v1"
+mkdir -p "$OUT"
+
+PYTHONPATH=src python -m xvc2_student.build_student_manifest \
+  --codec-manifest-dir "$CODEC_MANIFEST_DIR" \
+  --libriheavy-root /absolute/path/to/libriheavy \
+  --librilight-root /absolute/path/to/LibriLight \
+  --output-dir "$OUT" \
+  --target-train-hours 5000 \
+  --max-librilight-hours-per-speaker 30 \
+  --text-source book \
+  --seed 1 \
+  2>&1 | tee "$OUT/run.log"
+```
+
+默认自动寻找 LibriHeavy root 下的 `libriheavy_cuts_small.jsonl.gz` 和
+`libriheavy_cuts_medium.jsonl.gz`；也可以重复传入 `--libriheavy-manifest PATH` 覆盖自动发现。
+候选通过临时 SQLite 和稳定哈希排序，避免把百万级 cuts 全部放入内存。输出为
+`train.jsonl`、`validation.jsonl`、`test.jsonl`、`report.json` 与 `report.md`。若有效匹配
+不足 5000 小时，已有结果仍会写出，但状态为 `NEEDS_ATTENTION`；使用 `--all-matched` 可取消
+固定总时长目标。
+
+LibriHeavy 行指向 LibriLight raw 长录音，并保留 `start_seconds` 与 `duration_seconds`。
+当前 `PhoneManifestDataset` 尚未按这两个字段截取波形，因此这份 manifest 需要下一阶段的
+segment-aware DataLoader 更新后才能直接训练，不能把 raw 整段误当成一个 cut。
+
 ```bash
 xvc2-student-audit manifest \
   --manifest train=/path/train.jsonl \

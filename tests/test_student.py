@@ -4,6 +4,7 @@ import torch
 
 from xvc2_student.audit import audit_manifests
 from xvc2_student.build_audio_manifest import build_manifests, select_librilight
+from xvc2_student.build_student_manifest import build_student_manifests
 from xvc2_student.checkpoint import load_checkpoint, save_checkpoint
 from xvc2_student.config import ExperimentConfig
 from xvc2_student.env_check import version_tuple
@@ -64,6 +65,37 @@ def test_manifest_audit_detects_split_leakage(tmp_path: Path) -> None:
     report = audit_manifests(paths)
     assert report["status"] == "FAIL"
     assert report["leakage"]["speaker"]["count"] == 1
+
+
+def test_manifest_audit_counts_cut_duration(tmp_path: Path) -> None:
+    import json
+    import wave
+
+    audio = tmp_path / "raw.wav"
+    with wave.open(str(audio), "wb") as stream:
+        stream.setnchannels(1)
+        stream.setsampwidth(2)
+        stream.setframerate(16_000)
+        stream.writeframes(b"\x00\x00" * 160_000)
+    manifest = tmp_path / "cut.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "utterance_id": "libriheavy/small/cut",
+                "audio_path": str(audio),
+                "speaker_id": "1",
+                "chapter_or_book_id": "2",
+                "start_seconds": 2.0,
+                "duration_seconds": 3.0,
+                "phone_ids": [1, 2],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    report = audit_manifests([("train", manifest)])
+    assert report["status"] == "PASS"
+    assert report["manifests"]["train"]["hours_scanned"] == 3 / 3600
 
 
 def test_version_tuple() -> None:
@@ -341,3 +373,126 @@ def test_select_all_librilight_with_speaker_cap() -> None:
     assert {row["utterance_id"] for row in selected if row["speaker_id"] == "2"} == {"d"}
     assert counts["selection_mode"] == "all_eligible"
     assert counts["skipped_speaker_cap"] == 1
+
+
+def test_build_student_manifests_from_codec_and_libriheavy(tmp_path: Path, monkeypatch) -> None:
+    import gzip
+    import json
+    import sys
+    import types
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cmudict",
+        types.SimpleNamespace(
+            dict=lambda: {
+                "test": [["T", "EH1", "S", "T"]],
+                "transcript": [["T", "R", "AE1", "N", "S", "K", "R", "IH2", "P", "T"]],
+            }
+        ),
+    )
+
+    codec_dir = tmp_path / "codec"
+    codec_dir.mkdir()
+    audio_root = tmp_path / "LibriLight"
+    raw_audio = audio_root / "raw" / "small" / "8" / "book.flac"
+    raw_audio.parent.mkdir(parents=True)
+    raw_audio.write_bytes(b"not-decoded")
+    speech_audio = tmp_path / "speech.flac"
+    speech_audio.write_bytes(b"not-decoded")
+
+    speech_row = {
+        "utterance_id": "librispeech/train-clean-100/1-2-0000",
+        "corpus": "librispeech",
+        "subset": "train-clean-100",
+        "speaker_id": "1",
+        "chapter_or_book_id": "2",
+        "audio_path": str(speech_audio),
+        "sample_rate": 16_000,
+        "channels": 1,
+        "num_frames": 16_000,
+        "duration_seconds": 1.0,
+        "text": "TEST TRANSCRIPT",
+    }
+    light_row = {
+        "utterance_id": "librilight/vad/small/8/20/book_0000",
+        "corpus": "librilight",
+        "subset": "vad/small",
+        "speaker_id": "8",
+        "chapter_or_book_id": "20",
+        "audio_path": str(tmp_path / "vad.flac"),
+        "sample_rate": 16_000,
+        "channels": 1,
+        "num_frames": 32_000,
+        "duration_seconds": 2.0,
+        "snr": 12.0,
+        "raw_recording_id": "book",
+        "raw_metadata_path": str(tmp_path / "book.json"),
+    }
+    (codec_dir / "train_audio.jsonl").write_text(
+        json.dumps(speech_row) + "\n" + json.dumps(light_row) + "\n", encoding="utf-8"
+    )
+    for split, subset, speaker in (
+        ("validation", "dev-clean", "4"),
+        ("test", "test-clean", "6"),
+    ):
+        row = dict(speech_row)
+        row.update(
+            {
+                "utterance_id": f"librispeech/{subset}/{speaker}-2-0000",
+                "subset": subset,
+                "speaker_id": speaker,
+            }
+        )
+        (codec_dir / f"{split}_audio.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    libriheavy_root = tmp_path / "LibriHeavy"
+    libriheavy_root.mkdir()
+    cut = {
+        "id": "small/8/book_0000",
+        "start": 1.25,
+        "duration": 2.5,
+        "supervisions": [
+            {
+                "recording_id": "small/8/book",
+                "speaker": "8",
+                "custom": {"texts": ["TEST TRANSCRIPT", "TEST TRANSCRIPT"]},
+            }
+        ],
+        "recording": {
+            "sampling_rate": 16_000,
+            "sources": [{"type": "file", "source": "download/librilight/small/8/book.flac"}],
+        },
+    }
+    manifest = libriheavy_root / "libriheavy_cuts_small.jsonl.gz"
+    with gzip.open(manifest, "wt", encoding="utf-8") as stream:
+        stream.write(json.dumps(cut) + "\n")
+
+    output = tmp_path / "student"
+    vocabulary = Path(__file__).parents[1] / "assets" / "ctc_gop_teacher_vocab.json"
+    report = build_student_manifests(
+        codec_dir,
+        libriheavy_root,
+        audio_root,
+        output,
+        vocabulary,
+        target_train_hours=None,
+        g2p_fallback=False,
+    )
+
+    assert report["status"] == "PASS"
+    assert report["codec_overlap"]["selected_recordings"] == 1
+    assert report["codec_overlap"]["matched_recordings"] == 1
+    assert report["codec_overlap"]["unmatched_recordings"] == 0
+    assert report["codec_overlap"]["unmatched_examples"] == []
+    train_rows = [json.loads(line) for line in (output / "train.jsonl").read_text().splitlines()]
+    assert len(train_rows) == 2
+    heavy = next(row for row in train_rows if row["corpus"] == "libriheavy")
+    assert heavy["audio_path"] == str(raw_audio.resolve())
+    assert heavy["start_seconds"] == 1.25
+    assert heavy["duration_seconds"] == 2.5
+    assert heavy["normalized_text"] == "TEST TRANSCRIPT"
+    assert heavy["text_source"] == "book"
+    assert heavy["phone_ids"]
+    assert (output / "validation.jsonl").is_file()
+    assert (output / "test.jsonl").is_file()
