@@ -59,6 +59,9 @@ Torch/torchaudio minor version、CUDA 可见性、Emformer 和 Wav2Vec2FeatureEn
 
 训练 manifest 为 JSONL，phone ID 必须使用 Teacher 的 40 类词表，其中 `0` 为 blank：
 
+仓库固定了一份与 `checkpoint-8000/vocab.json` 字节一致的词表：
+`assets/ctc_gop_teacher_vocab.json`。
+
 ```json
 {
   "utterance_id": "84-121123-0001",
