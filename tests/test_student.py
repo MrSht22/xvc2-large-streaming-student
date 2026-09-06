@@ -19,7 +19,12 @@ from xvc2_student.losses import valid_feature_loss
 from xvc2_student.model import StreamingPhoneEncoder
 from xvc2_student.smoke import tiny_config
 from xvc2_student.teacher import loading_failures, remap_legacy_position_conv
-from xvc2_student.train import collect_step_metrics, optimizer_step_due, override_max_steps
+from xvc2_student.train import (
+    collect_step_metrics,
+    ddp_options,
+    optimizer_step_due,
+    override_max_steps,
+)
 
 
 def test_phone_manifest_dataset_random_access_and_audio_segments(tmp_path: Path) -> None:
@@ -197,6 +202,10 @@ def test_training_runtime_helpers() -> None:
     )
     assert metrics["global_audio_seconds_per_second"] == 4.0
     assert metrics["memory_by_rank"] == []
+    options = ddp_options(2)
+    assert options["device_ids"] == [2]
+    assert options["gradient_as_bucket_view"] is True
+    assert "static_graph" not in options
 
 
 def test_checkpoint_roundtrip(tmp_path: Path) -> None:

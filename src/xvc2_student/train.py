@@ -51,6 +51,15 @@ def optimizer_step_due(micro_step: int, grad_accum: int) -> bool:
     return (micro_step + 1) % grad_accum == 0
 
 
+def ddp_options(local_rank: int) -> dict[str, Any]:
+    return {
+        "device_ids": [local_rank],
+        "output_device": local_rank,
+        "broadcast_buffers": False,
+        "gradient_as_bucket_view": True,
+    }
+
+
 def collect_step_metrics(
     device: torch.device,
     world_size: int,
@@ -191,14 +200,7 @@ def main() -> None:
     training_model: torch.nn.Module = model
     ddp_model: DistributedDataParallel | None = None
     if world_size > 1:
-        ddp_model = DistributedDataParallel(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            broadcast_buffers=False,
-            gradient_as_bucket_view=True,
-            static_graph=True,
-        )
+        ddp_model = DistributedDataParallel(model, **ddp_options(local_rank))
         training_model = ddp_model
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if rank == 0:
