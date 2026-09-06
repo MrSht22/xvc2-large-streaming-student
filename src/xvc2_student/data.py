@@ -20,6 +20,7 @@ class PhoneManifestDataset(Dataset):
         self.sample_rate = sample_rate
         self.offsets = array("Q")
         self.line_numbers = array("I")
+        self.sample_counts = array("I")
         self.first_segment_index: int | None = None
         self._manifest: BinaryIO | None = None
         self._manifest_pid: int | None = None
@@ -41,6 +42,10 @@ class PhoneManifestDataset(Dataset):
                     self.first_segment_index = len(self.offsets)
                 self.offsets.append(offset)
                 self.line_numbers.append(line_number)
+                duration = item.get("duration_seconds")
+                self.sample_counts.append(
+                    round(float(duration) * self.sample_rate) if duration is not None else 0
+                )
         if not self.offsets:
             raise RuntimeError(f"No items in {self.path}")
 
@@ -202,3 +207,125 @@ class StatefulDistributedSampler(Sampler[int]):
     def next_epoch(self) -> None:
         self.epoch += 1
         self.position = 0
+
+
+class StatefulDistributedBatchSampler(Sampler[list[int]]):
+    """Deterministic duration buckets with a padded-audio budget per rank."""
+
+    def __init__(
+        self,
+        sample_counts: array,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: int = 1,
+        max_batch_samples: int = 960_000,
+        max_batch_items: int = 8,
+        bucket_size: int = 2_048,
+        epoch: int = 0,
+        position: int = 0,
+    ) -> None:
+        if not sample_counts or any(count <= 0 for count in sample_counts):
+            raise ValueError("Dynamic batching requires positive sample counts for every item")
+        if min(world_size, max_batch_samples, max_batch_items, bucket_size) <= 0:
+            raise ValueError("World size and dynamic batching limits must be positive")
+        if not 0 <= rank < world_size:
+            raise ValueError("Rank must be in [0, world_size)")
+        self.sample_counts = sample_counts
+        self.rank = rank
+        self.world_size = world_size
+        self.seed = seed
+        self.max_batch_samples = max_batch_samples
+        self.max_batch_items = max_batch_items
+        self.bucket_size = bucket_size
+        self.epoch = epoch
+        self.position = position
+        self.length_order = array(
+            "I", sorted(range(len(sample_counts)), key=lambda index: (sample_counts[index], index))
+        )
+        self._cached_epoch: int | None = None
+        self._cached_batches: list[list[int]] = []
+        self.padding_batches = 0
+
+    def _global_order(self) -> list[int]:
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        bucket_starts = list(range(0, len(self.length_order), self.bucket_size))
+        bucket_order = torch.randperm(len(bucket_starts), generator=generator).tolist()
+        ordered: list[int] = []
+        for bucket_index in bucket_order:
+            start = bucket_starts[bucket_index]
+            bucket = self.length_order[start : start + self.bucket_size]
+            permutation = torch.randperm(len(bucket), generator=generator).tolist()
+            ordered.extend(int(bucket[index]) for index in permutation)
+        padding = (-len(ordered)) % self.world_size
+        ordered.extend(ordered[:padding])
+        return ordered
+
+    def _pack(self, indices: list[int]) -> list[list[int]]:
+        batches: list[list[int]] = []
+        batch: list[int] = []
+        maximum = 0
+        for index in indices:
+            sample_count = self.sample_counts[index]
+            next_maximum = max(maximum, sample_count)
+            exceeds_budget = next_maximum * (len(batch) + 1) > self.max_batch_samples
+            if batch and (len(batch) >= self.max_batch_items or exceeds_budget):
+                batches.append(batch)
+                batch = []
+                maximum = 0
+                next_maximum = sample_count
+            batch.append(index)
+            maximum = next_maximum
+        if batch:
+            batches.append(batch)
+        return batches
+
+    def _batches(self) -> list[list[int]]:
+        if self._cached_epoch == self.epoch:
+            return self._cached_batches
+        ordered = self._global_order()
+        batches_by_rank = [
+            self._pack(ordered[rank :: self.world_size]) for rank in range(self.world_size)
+        ]
+        batch_counts = [len(batches) for batches in batches_by_rank]
+        target_count = max(len(batches) for batches in batches_by_rank)
+        for batches in batches_by_rank:
+            original_count = len(batches)
+            batches.extend(
+                list(batches[index % original_count])
+                for index in range(target_count - original_count)
+            )
+        self.padding_batches = target_count - batch_counts[self.rank]
+        self._cached_batches = batches_by_rank[self.rank]
+        self._cached_epoch = self.epoch
+        return self._cached_batches
+
+    def __iter__(self):
+        return iter(self._batches()[self.position :])
+
+    def __len__(self) -> int:
+        return len(self._batches()) - self.position
+
+    def state_dict(self) -> dict[str, int]:
+        return {
+            "epoch": self.epoch,
+            "position": self.position,
+            "max_batch_samples": self.max_batch_samples,
+            "max_batch_items": self.max_batch_items,
+            "bucket_size": self.bucket_size,
+        }
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        for name in ("max_batch_samples", "max_batch_items", "bucket_size"):
+            if int(state.get(name, getattr(self, name))) != getattr(self, name):
+                raise RuntimeError(f"Resume {name} differs from the current dynamic batch setting")
+        self.epoch = int(state["epoch"])
+        self.position = int(state["position"])
+        self._cached_epoch = None
+
+    def advance(self) -> None:
+        self.position += 1
+
+    def next_epoch(self) -> None:
+        self.epoch += 1
+        self.position = 0
+        self._cached_epoch = None

@@ -5,26 +5,67 @@ import sys
 import pytest
 import torch
 from torch.utils.data import DataLoader
+from transformers import Wav2Vec2Config, Wav2Vec2ForCTC
 
 from xvc2_student.audit import audit_loader, audit_manifests
 from xvc2_student.build_audio_manifest import build_manifests, select_librilight
 from xvc2_student.build_student_manifest import PhoneConversionPool, build_student_manifests
 from xvc2_student.checkpoint import load_checkpoint, save_checkpoint
 from xvc2_student.config import ExperimentConfig
-from xvc2_student.data import PhoneManifestDataset, collate
+from xvc2_student.data import (
+    PhoneManifestDataset,
+    StatefulDistributedBatchSampler,
+    collate,
+)
 from xvc2_student.env_check import version_tuple
 from xvc2_student.inspect_audio_corpora import combined_report, inspect_corpus
 from xvc2_student.inspect_libriheavy import inspect_repository
 from xvc2_student.losses import valid_feature_loss
 from xvc2_student.model import StreamingPhoneEncoder
 from xvc2_student.smoke import tiny_config
-from xvc2_student.teacher import loading_failures, remap_legacy_position_conv
+from xvc2_student.teacher import (
+    configure_attention,
+    loading_failures,
+    optimized_teacher_targets,
+    remap_legacy_position_conv,
+    teacher_targets,
+)
 from xvc2_student.train import (
     collect_step_metrics,
     ddp_options,
     optimizer_step_due,
     override_max_steps,
 )
+
+
+def tiny_teacher_config(
+    stable_layer_norm: bool = True, attention_implementation: str = "eager"
+) -> Wav2Vec2Config:
+    config = Wav2Vec2Config(
+        vocab_size=10,
+        hidden_size=16,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        intermediate_size=32,
+        conv_dim=(8, 8),
+        conv_stride=(2, 2),
+        conv_kernel=(4, 2),
+        conv_bias=True,
+        feat_extract_norm="layer",
+        num_conv_pos_embeddings=8,
+        num_conv_pos_embedding_groups=2,
+        do_stable_layer_norm=stable_layer_norm,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        activation_dropout=0.0,
+        feat_proj_dropout=0.0,
+        final_dropout=0.0,
+        layerdrop=0.0,
+        mask_time_prob=0.0,
+        mask_feature_prob=0.0,
+    )
+    configure_attention(config, attention_implementation)
+    return config
 
 
 def test_phone_manifest_dataset_random_access_and_audio_segments(tmp_path: Path) -> None:
@@ -177,6 +218,107 @@ def test_forward_and_feature_loss() -> None:
     assert torch.isfinite(loss)
 
 
+def test_student_reuses_convolution_features() -> None:
+    model = StreamingPhoneEncoder(tiny_config()).eval()
+    samples = model.receptive_field_samples + model.stride_samples * 7
+    waveform = torch.randn(2, samples)
+    lengths = torch.tensor([samples, samples])
+    convolution = model.feature_extractor(waveform)
+    direct = model(waveform, lengths)
+    shared = model(waveform, lengths, convolution_features=convolution)
+    for name in ("distill_features", "phone_logits", "output_lengths"):
+        torch.testing.assert_close(direct[name], shared[name])
+
+
+@pytest.mark.parametrize("stable_layer_norm", [False, True])
+def test_optimized_teacher_targets_match_full_teacher(stable_layer_norm: bool) -> None:
+    teacher = Wav2Vec2ForCTC(tiny_teacher_config(stable_layer_norm)).eval()
+    waveform = torch.randn(2, 320)
+    lengths = torch.tensor([320, 280])
+    expected, expected_lengths = teacher_targets(teacher, waveform, lengths, layer=2)
+    actual, actual_lengths, convolution = optimized_teacher_targets(
+        teacher, waveform, lengths, layer=2
+    )
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_lengths, expected_lengths)
+    torch.testing.assert_close(convolution, teacher.wav2vec2.feature_extractor(waveform))
+    assert not convolution.is_inference()
+
+
+def test_sdpa_teacher_targets_match_eager() -> None:
+    eager = Wav2Vec2ForCTC(tiny_teacher_config(attention_implementation="eager")).eval()
+    sdpa = Wav2Vec2ForCTC(tiny_teacher_config(attention_implementation="sdpa")).eval()
+    sdpa.load_state_dict(eager.state_dict(), strict=True)
+    waveform = torch.randn(2, 320)
+    lengths = torch.tensor([320, 280])
+    eager_target, eager_lengths, _ = optimized_teacher_targets(eager, waveform, lengths, 2)
+    sdpa_target, sdpa_lengths, _ = optimized_teacher_targets(sdpa, waveform, lengths, 2)
+    torch.testing.assert_close(sdpa_target, eager_target, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(sdpa_lengths, eager_lengths)
+
+
+def test_shared_teacher_convolution_supports_student_backward() -> None:
+    teacher = Wav2Vec2ForCTC(tiny_teacher_config()).eval()
+    student = StreamingPhoneEncoder(tiny_config())
+    student.load_teacher_frontend(teacher)
+    waveform = torch.randn(2, 320)
+    lengths = torch.tensor([320, 280])
+    _, _, convolution = optimized_teacher_targets(teacher, waveform, lengths, 2)
+    output = student(waveform, lengths, convolution_features=convolution)
+    output["distill_features"].square().mean().backward()
+    assert student.input_projection.weight.grad is not None
+
+
+def test_distributed_dynamic_batches_are_deterministic_and_balanced() -> None:
+    from array import array
+
+    sample_counts = array("I", [8, 9, 10, 11, 80, 90, 100, 110, 120, 130, 140, 150])
+    samplers = [
+        StatefulDistributedBatchSampler(
+            sample_counts,
+            rank=rank,
+            world_size=2,
+            seed=7,
+            max_batch_samples=240,
+            max_batch_items=4,
+            bucket_size=6,
+        )
+        for rank in range(2)
+    ]
+    batches = [list(sampler) for sampler in samplers]
+    assert len(batches[0]) == len(batches[1])
+    assert batches[0] == list(
+        StatefulDistributedBatchSampler(
+            sample_counts,
+            rank=0,
+            world_size=2,
+            seed=7,
+            max_batch_samples=240,
+            max_batch_items=4,
+            bucket_size=6,
+        )
+    )
+    for rank_batches in batches:
+        for batch in rank_batches:
+            assert len(batch) <= 4
+            assert (
+                max(sample_counts[index] for index in batch) * len(batch) <= 240 or len(batch) == 1
+            )
+    samplers[0].advance()
+    state = samplers[0].state_dict()
+    restored = StatefulDistributedBatchSampler(
+        sample_counts,
+        rank=0,
+        world_size=2,
+        seed=7,
+        max_batch_samples=240,
+        max_batch_items=4,
+        bucket_size=6,
+    )
+    restored.load_state_dict(state)
+    assert list(restored) == batches[0][1:]
+
+
 def test_training_runtime_helpers() -> None:
     config = ExperimentConfig()
     overridden = override_max_steps(config, 20)
@@ -195,12 +337,15 @@ def test_training_runtime_helpers() -> None:
         torch.device("cpu"),
         world_size=1,
         audio_seconds=8.0,
+        item_count=6,
+        optimizer_steps=2,
         elapsed_seconds=2.0,
         feature=torch.tensor(1.0),
         phones=torch.tensor(2.0),
         gradient_norm=torch.tensor(3.0),
     )
     assert metrics["global_audio_seconds_per_second"] == 4.0
+    assert metrics["mean_global_batch_size"] == 3.0
     assert metrics["memory_by_rank"] == []
     options = ddp_options(2)
     assert options["device_ids"] == [2]

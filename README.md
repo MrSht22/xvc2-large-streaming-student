@@ -239,46 +239,79 @@ python -m xvc2_student.train \
   --num-workers 0
 ```
 
-四卡：
+四卡推荐使用按时长动态组 batch。下面的 `60` 是每张卡每个 micro-batch 的 padded audio
+预算（秒），不是四卡总预算；单条音频超过预算时仍会作为单样本 batch 读取：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=1 NCCL_DEBUG=WARN \
+PYTHONPATH=src torchrun --standalone --nproc_per_node=4 \
   -m xvc2_student.train \
   --config configs/student_12x768.yaml \
   --manifest /path/student_train_manifest.jsonl \
   --teacher /path/is24/models/checkpoint-8000 \
   --output-dir runs/student-12x768-v1 \
-  --batch-size 2 \
-  --grad-accum 2 \
-  --num-workers 1
+  --max-batch-audio-seconds 60 \
+  --max-batch-items 8 \
+  --duration-bucket-size 2048 \
+  --grad-accum 1 \
+  --num-workers 1 \
+  --prefetch-factor 2 \
+  --teacher-attention sdpa
 ```
 
 继续训练时传入 `--resume runs/.../step-XXXXXX.pt`。Checkpoint 包含模型、optimizer、
 scheduler、sampler epoch/position 和 Python/Torch/CUDA RNG state。
 
 四卡训练会对 Teacher 和 Student 同时使用 BF16 autocast，CUDA 上使用 fused AdamW，并在梯度
-累积的非末尾 micro-step 通过 DDP `no_sync()` 跳过冗余 all-reduce。`--num-workers` 按 rank
-计数；10 核 CPU 配合 4 个训练 rank 时从每 rank 1 个 worker 开始。日志包含全局音频吞吐和
-每个 rank 的峰值 allocated/reserved 显存。
+累积的非末尾 micro-step 通过 DDP `no_sync()` 跳过冗余 all-reduce。动态 batch 先在相近时长的
+bucket 内打乱，再按 padded audio 预算组 batch，以减少随机长短样本混合造成的 padding。四个 rank
+会得到相同 batch 数，sampler 的 epoch 和 batch 位置也会写入 checkpoint。
+
+默认训练路径还会：只执行 Teacher Layer 1--20，跳过 Layer 21--24 和 Teacher CTC head；复用一次
+Teacher frozen convolution 结果作为 Student frontend 输入；并允许 Teacher 使用 PyTorch SDPA。
+启动时每个 rank 会用一段 0.5 秒零波形比较完整 Teacher 与 early-exit target，只有数值一致才进入
+训练。以下开关分别用于回退和做消融：
+
+```text
+--teacher-attention eager          使用原始 eager attention
+--full-teacher-forward             恢复完整 24-layer Teacher 和独立 Student frontend
+--no-shared-frontend               保留 early exit，但让 Student 再计算一次 convolution
+--skip-teacher-optimization-check  跳过启动时的完整/优化 Teacher 一致性检查
+```
+
+`--num-workers` 按 rank 计数；10 核 CPU 配合 4 个训练 rank 时从每 rank 1 个 worker 开始。日志包含
+实际全局样本数、平均 global batch size、全局音频吞吐、动态 batch 参数和每个 rank 的峰值
+allocated/reserved 显存。
 
 正式训练前的 20-step 四卡门槛可直接覆盖配置中的 200000 step，不修改正式配置文件：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=1 \
-torchrun --standalone --nproc_per_node=4 \
+MANIFEST="$PWD/runs/student-manifest-2500h-v1/train.jsonl"
+TEACHER=/absolute/path/to/checkpoint-8000
+OUT="$PWD/runs/student-4xh100-optimized-preflight"
+mkdir -p "$OUT"
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=1 NCCL_DEBUG=WARN \
+PYTHONPATH=src torchrun --standalone --nproc_per_node=4 \
   -m xvc2_student.train \
   --config configs/student_12x768.yaml \
-  --manifest runs/student-manifest-2500h-v1/train.jsonl \
-  --teacher /path/checkpoint-8000 \
-  --output-dir runs/student-4xh100-preflight \
-  --batch-size 2 \
-  --grad-accum 2 \
+  --manifest "$MANIFEST" \
+  --teacher "$TEACHER" \
+  --output-dir "$OUT" \
+  --max-batch-audio-seconds 60 \
+  --max-batch-items 8 \
+  --duration-bucket-size 2048 \
+  --grad-accum 1 \
   --num-workers 1 \
-  --max-steps 20
+  --prefetch-factor 2 \
+  --teacher-attention sdpa \
+  --max-steps 20 \
+  2>&1 | tee "$OUT/train.log"
 ```
 
-该配置的 effective global batch size 为 16。确认四个 rank 的显存、吞吐和 loss 都正常后，优先
-增大每卡 batch size，再相应减小 grad accumulation，以减少通信和 optimizer step 开销。
+动态 batch 的实际 global batch size 随时长变化，不再固定为 16；日志中的
+`mean_global_batch_size` 给出每个统计窗口的实际均值。20-step 只用于速度和显存检查，因为
+`--max-steps 20` 也会让学习率调度器在第 20 步降到零，不能据此判断正式训练收敛。
 
 ## Flow-OPD 结论
 

@@ -17,10 +17,20 @@ from torch.utils.data import DataLoader
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .config import ExperimentConfig, load_config
-from .data import PhoneManifestDataset, StatefulDistributedSampler, collate
+from .data import (
+    PhoneManifestDataset,
+    StatefulDistributedBatchSampler,
+    StatefulDistributedSampler,
+    collate,
+)
 from .losses import ctc_loss, valid_feature_loss
 from .model import StreamingPhoneEncoder, parameter_breakdown
-from .teacher import load_teacher, teacher_targets
+from .teacher import (
+    load_teacher,
+    optimized_teacher_targets,
+    teacher_targets,
+    verify_optimized_teacher,
+)
 
 
 def runtime(device_arg: str) -> tuple[torch.device, int, int, int]:
@@ -64,6 +74,8 @@ def collect_step_metrics(
     device: torch.device,
     world_size: int,
     audio_seconds: float,
+    item_count: int,
+    optimizer_steps: int,
     elapsed_seconds: float,
     feature: torch.Tensor,
     phones: torch.Tensor,
@@ -75,11 +87,13 @@ def collect_step_metrics(
         dtype=torch.float64,
     )
     audio = torch.tensor(audio_seconds, device=device, dtype=torch.float64)
+    items = torch.tensor(item_count, device=device, dtype=torch.float64)
     elapsed = torch.tensor(elapsed_seconds, device=device, dtype=torch.float64)
     if world_size > 1:
         dist.all_reduce(losses, op=dist.ReduceOp.SUM)
         losses /= world_size
         dist.all_reduce(audio, op=dist.ReduceOp.SUM)
+        dist.all_reduce(items, op=dist.ReduceOp.SUM)
         dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
     memory_by_rank: list[dict[str, float]] = []
     if device.type == "cuda":
@@ -109,6 +123,8 @@ def collect_step_metrics(
         "ctc_loss": float(losses[1]),
         "gradient_norm": float(losses[2]),
         "global_audio_seconds": float(audio),
+        "global_items": int(items),
+        "mean_global_batch_size": float(items / max(optimizer_steps, 1)),
         "elapsed_seconds": float(elapsed),
         "global_audio_seconds_per_second": float(audio / elapsed.clamp_min(1e-9)),
         "memory_by_rank": memory_by_rank,
@@ -124,14 +140,32 @@ def main() -> None:
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--max-batch-audio-seconds", type=float)
+    parser.add_argument("--max-batch-items", type=int, default=8)
+    parser.add_argument("--duration-bucket-size", type=int, default=2_048)
     parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--teacher-attention", choices=("eager", "sdpa"), default="eager")
+    parser.add_argument("--full-teacher-forward", action="store_true")
+    parser.add_argument("--no-shared-frontend", action="store_true")
+    parser.add_argument("--skip-teacher-optimization-check", action="store_true")
     args = parser.parse_args()
 
-    if min(args.batch_size, args.grad_accum, args.prefetch_factor) <= 0:
-        parser.error("batch-size, grad-accum, and prefetch-factor must be positive")
+    if (
+        min(
+            args.batch_size,
+            args.max_batch_items,
+            args.duration_bucket_size,
+            args.grad_accum,
+            args.prefetch_factor,
+        )
+        <= 0
+    ):
+        parser.error("Batch, bucket, accumulation, and prefetch settings must be positive")
+    if args.max_batch_audio_seconds is not None and args.max_batch_audio_seconds <= 0:
+        parser.error("max-batch-audio-seconds must be positive")
     if args.num_workers < 0:
         parser.error("num-workers cannot be negative")
     if args.max_steps is not None and args.max_steps <= 0:
@@ -149,23 +183,47 @@ def main() -> None:
     random.seed(config.training.seed + rank)
     torch.manual_seed(config.training.seed + rank)
     dataset = PhoneManifestDataset(args.manifest)
-    sampler = StatefulDistributedSampler(len(dataset), rank, world_size, config.training.seed)
+    dynamic_batching = args.max_batch_audio_seconds is not None
+    if dynamic_batching:
+        sampler: StatefulDistributedSampler | StatefulDistributedBatchSampler = (
+            StatefulDistributedBatchSampler(
+                dataset.sample_counts,
+                rank,
+                world_size,
+                config.training.seed,
+                max_batch_samples=round(args.max_batch_audio_seconds * dataset.sample_rate),
+                max_batch_items=args.max_batch_items,
+                bucket_size=args.duration_bucket_size,
+            )
+        )
+    else:
+        sampler = StatefulDistributedSampler(len(dataset), rank, world_size, config.training.seed)
     loader_options: dict[str, Any] = {}
     if args.num_workers:
         loader_options.update(
             persistent_workers=True,
             prefetch_factor=args.prefetch_factor,
         )
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        sampler=sampler,
-        num_workers=args.num_workers,
-        collate_fn=collate,
-        pin_memory=device.type == "cuda",
-        **loader_options,
-    )
-    teacher = load_teacher(args.teacher).to(device)
+    if dynamic_batching:
+        loader = DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=args.num_workers,
+            collate_fn=collate,
+            pin_memory=device.type == "cuda",
+            **loader_options,
+        )
+    else:
+        loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            collate_fn=collate,
+            pin_memory=device.type == "cuda",
+            **loader_options,
+        )
+    teacher = load_teacher(args.teacher, args.teacher_attention).to(device)
     model = StreamingPhoneEncoder(config.model)
     model.load_teacher_frontend(teacher)
     model.to(device)
@@ -203,6 +261,18 @@ def main() -> None:
         ddp_model = DistributedDataParallel(model, **ddp_options(local_rank))
         training_model = ddp_model
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    teacher_optimization_report = None
+    if not args.full_teacher_forward and not args.skip_teacher_optimization_check:
+        verification_samples = max(model.receptive_field_samples, dataset.sample_rate // 2)
+        verification_waveform = torch.zeros(1, verification_samples, device=device)
+        verification_lengths = torch.tensor([verification_samples], device=device)
+        with torch.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
+            teacher_optimization_report = verify_optimized_teacher(
+                teacher,
+                verification_waveform,
+                verification_lengths,
+                config.distillation.teacher_layer,
+            )
     if rank == 0:
         print(
             json.dumps(
@@ -211,44 +281,83 @@ def main() -> None:
                     "config": config.to_dict(),
                     "runtime": {
                         "world_size": world_size,
-                        "batch_size_per_rank": args.batch_size,
+                        "batch_size_per_rank": None if dynamic_batching else args.batch_size,
+                        "max_batch_audio_seconds_per_rank": args.max_batch_audio_seconds,
+                        "max_batch_items_per_rank": (
+                            args.max_batch_items if dynamic_batching else None
+                        ),
+                        "duration_bucket_size": (
+                            args.duration_bucket_size if dynamic_batching else None
+                        ),
                         "grad_accum": args.grad_accum,
                         "effective_global_batch_size": (
-                            world_size * args.batch_size * args.grad_accum
+                            None
+                            if dynamic_batching
+                            else world_size * args.batch_size * args.grad_accum
                         ),
                         "num_workers_per_rank": args.num_workers,
                         "prefetch_factor": args.prefetch_factor if args.num_workers else None,
                         "amp": config.training.amp,
                         "teacher_autocast": use_amp,
+                        "teacher_attention": args.teacher_attention,
+                        "optimized_teacher_forward": not args.full_teacher_forward,
+                        "shared_convolution_frontend": (
+                            not args.full_teacher_forward and not args.no_shared_frontend
+                        ),
                         "fused_adamw": device.type == "cuda",
+                        "batches_per_epoch_per_rank": len(sampler),
+                        "dynamic_padding_batches": (
+                            sampler.padding_batches if dynamic_batching else None
+                        ),
                     },
+                    "teacher_optimization_check": teacher_optimization_report,
                 }
             )
         )
     optimizer.zero_grad(set_to_none=True)
     micro_step = 0
     window_audio_seconds = 0.0
+    window_items = 0
+    window_optimizer_steps = 0
     window_started = time.perf_counter()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     while step < config.training.max_steps:
         for batch in loader:
             window_audio_seconds += float(batch["sample_lengths"].sum()) / dataset.sample_rate
+            window_items += len(batch["utterance_ids"])
             waveform = batch["waveform"].to(device, non_blocking=True)
             lengths = batch["sample_lengths"].to(device, non_blocking=True)
             targets = batch["targets"].to(device, non_blocking=True)
             target_lengths = batch["target_lengths"].to(device, non_blocking=True)
             with torch.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-                teacher_hidden, teacher_lengths = teacher_targets(
-                    teacher, waveform, lengths, config.distillation.teacher_layer
-                )
+                if args.full_teacher_forward:
+                    teacher_hidden, teacher_lengths = teacher_targets(
+                        teacher, waveform, lengths, config.distillation.teacher_layer
+                    )
+                    convolution_features = None
+                else:
+                    teacher_hidden, teacher_lengths, convolution_features = (
+                        optimized_teacher_targets(
+                            teacher,
+                            waveform,
+                            lengths,
+                            config.distillation.teacher_layer,
+                        )
+                    )
+                    if args.no_shared_frontend:
+                        convolution_features = None
             synchronize = optimizer_step_due(micro_step, args.grad_accum)
             synchronization_context = (
                 nullcontext() if ddp_model is None or synchronize else ddp_model.no_sync()
             )
             with synchronization_context:
                 with torch.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-                    output = training_model(waveform, lengths)
+                    output = training_model(
+                        waveform,
+                        lengths,
+                        convolution_features=convolution_features,
+                    )
                     if not torch.equal(output["output_lengths"], teacher_lengths):
                         raise RuntimeError("Teacher and Student frame lengths differ")
                     feature = valid_feature_loss(
@@ -262,7 +371,10 @@ def main() -> None:
                         + config.distillation.ctc_weight * phones
                     ) / args.grad_accum
                 scaler.scale(loss).backward()
-            sampler.advance(len(batch["utterance_ids"]))
+            if dynamic_batching:
+                sampler.advance()
+            else:
+                sampler.advance(len(batch["utterance_ids"]))
             micro_step += 1
             if not synchronize:
                 continue
@@ -273,12 +385,15 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             step += 1
+            window_optimizer_steps += 1
             should_log = step == 1 or step % config.training.log_interval == 0
             if should_log:
                 metrics = collect_step_metrics(
                     device,
                     world_size,
                     window_audio_seconds,
+                    window_items,
+                    window_optimizer_steps,
                     time.perf_counter() - window_started,
                     feature,
                     phones,
@@ -296,6 +411,8 @@ def main() -> None:
                 )
             if should_log:
                 window_audio_seconds = 0.0
+                window_items = 0
+                window_optimizer_steps = 0
                 window_started = time.perf_counter()
                 if device.type == "cuda":
                     torch.cuda.reset_peak_memory_stats(device)

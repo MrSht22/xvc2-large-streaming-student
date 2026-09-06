@@ -104,9 +104,23 @@ class StreamingPhoneEncoder(torch.nn.Module):
         }
 
     def forward(
-        self, input_values: torch.Tensor, input_lengths: torch.Tensor
+        self,
+        input_values: torch.Tensor,
+        input_lengths: torch.Tensor,
+        convolution_features: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        convolution = self.feature_extractor(input_values)
+        convolution = (
+            self.feature_extractor(input_values)
+            if convolution_features is None
+            else convolution_features
+        )
+        if convolution.ndim != 3 or convolution.shape[0] != input_values.shape[0]:
+            raise ValueError("Expected convolution features with shape [batch, channels, frames]")
+        if convolution.shape[1] != self.config.conv_dim[-1]:
+            raise ValueError(
+                f"Expected {self.config.conv_dim[-1]} convolution channels, "
+                f"got {convolution.shape[1]}"
+            )
         features = self._project(convolution)
         lengths = self.output_lengths(input_lengths)
         valid = torch.arange(features.shape[1], device=features.device)[None] < lengths[:, None]
