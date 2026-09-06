@@ -248,16 +248,37 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 \
   --manifest /path/student_train_manifest.jsonl \
   --teacher /path/is24/models/checkpoint-8000 \
   --output-dir runs/student-12x768-v1 \
-  --batch-size 1 \
-  --grad-accum 8 \
-  --num-workers 0
+  --batch-size 2 \
+  --grad-accum 2 \
+  --num-workers 1
 ```
 
 继续训练时传入 `--resume runs/.../step-XXXXXX.pt`。Checkpoint 包含模型、optimizer、
 scheduler、sampler epoch/position 和 Python/Torch/CUDA RNG state。
-首次正式训练建议先以单卡跑 50--100 step，确认共享存储吞吐和切片读取无误后再启动 DDP。
-多卡首轮保持 `--num-workers 0`；稳定后再从每个 rank 1 个 worker 开始测吞吐，因为该参数按
-rank 计数，不能直接按整机 CPU 核数填写。
+
+四卡训练会对 Teacher 和 Student 同时使用 BF16 autocast，CUDA 上使用 fused AdamW，并在梯度
+累积的非末尾 micro-step 通过 DDP `no_sync()` 跳过冗余 all-reduce。`--num-workers` 按 rank
+计数；10 核 CPU 配合 4 个训练 rank 时从每 rank 1 个 worker 开始。日志包含全局音频吞吐和
+每个 rank 的峰值 allocated/reserved 显存。
+
+正式训练前的 20-step 四卡门槛可直接覆盖配置中的 200000 step，不修改正式配置文件：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=1 \
+torchrun --standalone --nproc_per_node=4 \
+  -m xvc2_student.train \
+  --config configs/student_12x768.yaml \
+  --manifest runs/student-manifest-2500h-v1/train.jsonl \
+  --teacher /path/checkpoint-8000 \
+  --output-dir runs/student-4xh100-preflight \
+  --batch-size 2 \
+  --grad-accum 2 \
+  --num-workers 1 \
+  --max-steps 20
+```
+
+该配置的 effective global batch size 为 16。确认四个 rank 的显存、吞吐和 loss 都正常后，优先
+增大每卡 batch size，再相应减小 grad accumulation，以减少通信和 optimizer step 开销。
 
 ## Flow-OPD 结论
 

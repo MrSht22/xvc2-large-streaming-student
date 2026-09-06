@@ -19,6 +19,7 @@ from xvc2_student.losses import valid_feature_loss
 from xvc2_student.model import StreamingPhoneEncoder
 from xvc2_student.smoke import tiny_config
 from xvc2_student.teacher import loading_failures, remap_legacy_position_conv
+from xvc2_student.train import collect_step_metrics, optimizer_step_due, override_max_steps
 
 
 def test_phone_manifest_dataset_random_access_and_audio_segments(tmp_path: Path) -> None:
@@ -169,6 +170,33 @@ def test_forward_and_feature_loss() -> None:
     )
     loss.backward()
     assert torch.isfinite(loss)
+
+
+def test_training_runtime_helpers() -> None:
+    config = ExperimentConfig()
+    overridden = override_max_steps(config, 20)
+    assert config.training.max_steps == 200_000
+    assert overridden.training.max_steps == 20
+    assert override_max_steps(config, None) is config
+    assert [optimizer_step_due(index, 3) for index in range(6)] == [
+        False,
+        False,
+        True,
+        False,
+        False,
+        True,
+    ]
+    metrics = collect_step_metrics(
+        torch.device("cpu"),
+        world_size=1,
+        audio_seconds=8.0,
+        elapsed_seconds=2.0,
+        feature=torch.tensor(1.0),
+        phones=torch.tensor(2.0),
+        gradient_norm=torch.tensor(3.0),
+    )
+    assert metrics["global_audio_seconds_per_second"] == 4.0
+    assert metrics["memory_by_rank"] == []
 
 
 def test_checkpoint_roundtrip(tmp_path: Path) -> None:
