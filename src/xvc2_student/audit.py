@@ -9,8 +9,10 @@ from typing import Any
 
 import torch
 import torchaudio
+from torch.utils.data import DataLoader, Subset
 
 from .config import load_config
+from .data import PhoneManifestDataset, collate
 from .model import StreamingPhoneEncoder
 from .teacher import load_teacher_with_loading_info, loading_failures, teacher_targets
 
@@ -61,9 +63,16 @@ def audit_manifests(
         counters: Counter[str] = Counter()
         seconds = 0.0
         sample_rates: Counter[int] = Counter()
-        rows = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        selected = rows[:max_items] if max_items is not None else rows
-        for line_number, line in enumerate(selected, 1):
+        rows_total = 0
+        with path.open(encoding="utf-8") as stream:
+            rows = []
+            for line_number, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+                rows_total += 1
+                if max_items is None or len(rows) < max_items:
+                    rows.append((line_number, line))
+        for line_number, line in rows:
             counters["rows"] += 1
             try:
                 item = json.loads(line)
@@ -110,7 +119,7 @@ def audit_manifests(
                 memberships["chapter"][f"{speaker}/{chapter}"].add(name)
         summaries[name] = {
             "path": str(path),
-            "rows_total": len(rows),
+            "rows_total": rows_total,
             "rows_scanned": counters["rows"],
             "hours_scanned": seconds / 3600,
             "sample_rates": dict(sorted(sample_rates.items())),
@@ -128,6 +137,56 @@ def audit_manifests(
             name: {"count": len(values), "examples": values[:20]}
             for name, values in leakage.items()
         },
+        "failures": failures,
+        "status": "PASS" if not failures else "FAIL",
+    }
+
+
+def audit_loader(
+    manifest: Path,
+    sample_rate: int = 16_000,
+    batch_size: int = 2,
+    num_workers: int = 0,
+    samples_per_region: int = 4,
+) -> dict[str, Any]:
+    dataset = PhoneManifestDataset(manifest, sample_rate=sample_rate)
+    starts = [0]
+    if dataset.first_segment_index is not None:
+        starts.append(dataset.first_segment_index)
+    indices = sorted(
+        {
+            index
+            for start in starts
+            for index in range(start, min(start + samples_per_region, len(dataset)))
+        }
+    )
+    loader = DataLoader(
+        Subset(dataset, indices),
+        batch_size=batch_size,
+        num_workers=num_workers,
+        collate_fn=collate,
+    )
+    utterance_ids: list[str] = []
+    sample_lengths: list[int] = []
+    for batch in loader:
+        utterance_ids.extend(batch["utterance_ids"])
+        sample_lengths.extend(int(value) for value in batch["sample_lengths"])
+    failures: list[str] = []
+    if len(utterance_ids) != len(indices):
+        failures.append("loader_item_count_mismatch")
+    if not sample_lengths or min(sample_lengths) <= 0:
+        failures.append("empty_waveform")
+    if dataset.first_segment_index is None:
+        failures.append("no_segmented_row_found")
+    return {
+        "manifest": str(manifest),
+        "manifest_items": len(dataset),
+        "first_segment_index": dataset.first_segment_index,
+        "sampled_indices": indices,
+        "sampled_utterance_ids": utterance_ids,
+        "sample_lengths": sample_lengths,
+        "batch_size": batch_size,
+        "num_workers": num_workers,
         "failures": failures,
         "status": "PASS" if not failures else "FAIL",
     }
@@ -203,6 +262,12 @@ def main() -> None:
     manifest_parser.add_argument("--manifest", action="append", required=True)
     manifest_parser.add_argument("--vocab-size", type=int, default=40)
     manifest_parser.add_argument("--max-items", type=int)
+    loader_parser = subparsers.add_parser("loader")
+    loader_parser.add_argument("--manifest", type=Path, required=True)
+    loader_parser.add_argument("--sample-rate", type=int, default=16_000)
+    loader_parser.add_argument("--batch-size", type=int, default=2)
+    loader_parser.add_argument("--num-workers", type=int, default=0)
+    loader_parser.add_argument("--samples-per-region", type=int, default=4)
     teacher_parser = subparsers.add_parser("teacher")
     teacher_parser.add_argument("--teacher", type=Path, required=True)
     teacher_parser.add_argument("--config", type=Path, required=True)
@@ -218,10 +283,21 @@ def main() -> None:
             ),
             "student_manifest_audit",
         )
-    else:
+    elif args.command == "teacher":
         emit(
             audit_teacher(args.teacher.resolve(), args.config.resolve(), args.device, args.seconds),
             "student_teacher_audit",
+        )
+    else:
+        emit(
+            audit_loader(
+                args.manifest.expanduser().resolve(),
+                args.sample_rate,
+                args.batch_size,
+                args.num_workers,
+                args.samples_per_region,
+            ),
+            "student_loader_audit",
         )
 
 

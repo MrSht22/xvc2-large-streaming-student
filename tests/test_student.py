@@ -1,12 +1,17 @@
+import pickle
 from pathlib import Path
+import sys
 
+import pytest
 import torch
+from torch.utils.data import DataLoader
 
-from xvc2_student.audit import audit_manifests
+from xvc2_student.audit import audit_loader, audit_manifests
 from xvc2_student.build_audio_manifest import build_manifests, select_librilight
 from xvc2_student.build_student_manifest import PhoneConversionPool, build_student_manifests
 from xvc2_student.checkpoint import load_checkpoint, save_checkpoint
 from xvc2_student.config import ExperimentConfig
+from xvc2_student.data import PhoneManifestDataset, collate
 from xvc2_student.env_check import version_tuple
 from xvc2_student.inspect_audio_corpora import combined_report, inspect_corpus
 from xvc2_student.inspect_libriheavy import inspect_repository
@@ -14,6 +19,142 @@ from xvc2_student.losses import valid_feature_loss
 from xvc2_student.model import StreamingPhoneEncoder
 from xvc2_student.smoke import tiny_config
 from xvc2_student.teacher import loading_failures, remap_legacy_position_conv
+
+
+def test_phone_manifest_dataset_random_access_and_audio_segments(tmp_path: Path) -> None:
+    import json
+    import struct
+    import wave
+
+    audio = tmp_path / "recording.wav"
+    with wave.open(str(audio), "wb") as stream:
+        stream.setnchannels(1)
+        stream.setsampwidth(2)
+        stream.setframerate(8_000)
+        samples = [1_000] * 8_000 + [-2_000] * 8_000 + [3_000] * 8_000
+        stream.writeframes(struct.pack(f"<{len(samples)}h", *samples))
+
+    rows = [
+        {
+            "utterance_id": "middle",
+            "audio_path": str(audio),
+            "sample_rate": 8_000,
+            "start_seconds": 1.0,
+            "duration_seconds": 1.0,
+            "phone_ids": [1, 2],
+        },
+        {
+            "utterance_id": "last",
+            "audio_path": str(audio),
+            "sample_rate": 8_000,
+            "start_seconds": 2.0,
+            "duration_seconds": 0.5,
+            "phone_ids": [3],
+        },
+    ]
+    manifest = tmp_path / "train.jsonl"
+    manifest.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    dataset = PhoneManifestDataset(manifest, sample_rate=16_000)
+    assert len(dataset) == 2
+    assert not hasattr(dataset, "items")
+    assert dataset[1]["utterance_id"] == "last"
+    assert dataset[-2]["utterance_id"] == "middle"
+    assert dataset[0]["waveform"].shape == (16_000,)
+    assert dataset[1]["waveform"].shape == (8_000,)
+    torch.testing.assert_close(
+        dataset[0]["waveform"].mean(), torch.tensor(-2_000 / 32_768), atol=5e-5, rtol=0
+    )
+    torch.testing.assert_close(
+        dataset[1]["waveform"].mean(), torch.tensor(3_000 / 32_768), atol=5e-5, rtol=0
+    )
+    restored = pickle.loads(pickle.dumps(dataset))
+    assert restored[1]["utterance_id"] == "last"
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="sandboxed macOS disallows OpenMP SHM")
+def test_phone_manifest_dataset_with_multiple_workers(tmp_path: Path) -> None:
+    import json
+    import wave
+
+    audio = tmp_path / "recording.wav"
+    with wave.open(str(audio), "wb") as stream:
+        stream.setnchannels(1)
+        stream.setsampwidth(2)
+        stream.setframerate(16_000)
+        stream.writeframes(b"\x00\x00" * 32_000)
+    manifest = tmp_path / "train.jsonl"
+    manifest.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "utterance_id": f"cut-{index}",
+                    "audio_path": str(audio),
+                    "sample_rate": 16_000,
+                    "start_seconds": index * 0.25,
+                    "duration_seconds": 0.25,
+                    "phone_ids": [index + 1],
+                }
+            )
+            for index in range(4)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    loader = DataLoader(
+        PhoneManifestDataset(manifest),
+        batch_size=2,
+        num_workers=2,
+        collate_fn=collate,
+    )
+    batches = list(loader)
+    assert [item for batch in batches for item in batch["utterance_ids"]] == [
+        "cut-0",
+        "cut-1",
+        "cut-2",
+        "cut-3",
+    ]
+    assert all(batch["waveform"].shape == (2, 4_000) for batch in batches)
+
+
+def test_loader_audit_samples_full_audio_and_segment(tmp_path: Path) -> None:
+    import json
+    import wave
+
+    audio = tmp_path / "recording.wav"
+    with wave.open(str(audio), "wb") as stream:
+        stream.setnchannels(1)
+        stream.setsampwidth(2)
+        stream.setframerate(16_000)
+        stream.writeframes(b"\x00\x00" * 32_000)
+    rows = [
+        {
+            "utterance_id": "librispeech/full",
+            "corpus": "librispeech",
+            "audio_path": str(audio),
+            "sample_rate": 16_000,
+            "duration_seconds": 2.0,
+            "phone_ids": [1],
+        },
+        {
+            "utterance_id": "libriheavy/cut",
+            "corpus": "libriheavy",
+            "audio_path": str(audio),
+            "sample_rate": 16_000,
+            "start_seconds": 0.5,
+            "duration_seconds": 0.25,
+            "phone_ids": [2],
+        },
+    ]
+    manifest = tmp_path / "train.jsonl"
+    manifest.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    report = audit_loader(manifest, samples_per_region=1)
+    assert report["status"] == "PASS"
+    assert report["first_segment_index"] == 1
+    assert report["sampled_indices"] == [0, 1]
+    assert report["sample_lengths"] == [32_000, 4_000]
 
 
 def test_forward_and_feature_loss() -> None:

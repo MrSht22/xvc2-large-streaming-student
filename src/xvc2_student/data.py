@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from array import array
 import json
+import os
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import torch
 import torchaudio
@@ -11,31 +13,127 @@ from torch.nn.utils.rnn import pad_sequence
 
 
 class PhoneManifestDataset(Dataset):
-    """JSONL dataset with precomputed phone IDs and absolute audio paths."""
+    """Random-access JSONL dataset with precomputed phone IDs and audio cuts."""
 
     def __init__(self, path: Path, sample_rate: int = 16_000) -> None:
+        self.path = path.expanduser().resolve()
         self.sample_rate = sample_rate
-        self.items: list[dict[str, Any]] = []
-        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if not line.strip():
-                continue
+        self.offsets = array("Q")
+        self.line_numbers = array("I")
+        self.first_segment_index: int | None = None
+        self._manifest: BinaryIO | None = None
+        self._manifest_pid: int | None = None
+        with self.path.open("rb") as stream:
+            line_number = 0
+            while True:
+                offset = stream.tell()
+                line = stream.readline()
+                if not line:
+                    break
+                line_number += 1
+                if not line.strip():
+                    continue
+                item = self._decode(line, line_number)
+                self._validate(item, line_number)
+                if self.first_segment_index is None and (
+                    item.get("corpus") == "libriheavy" or float(item.get("start_seconds", 0.0)) > 0
+                ):
+                    self.first_segment_index = len(self.offsets)
+                self.offsets.append(offset)
+                self.line_numbers.append(line_number)
+        if not self.offsets:
+            raise RuntimeError(f"No items in {self.path}")
+
+    def _decode(self, line: bytes, line_number: int) -> dict[str, Any]:
+        try:
             item = json.loads(line)
-            required = {"utterance_id", "audio_path", "phone_ids"}
-            missing = required - item.keys()
-            if missing:
-                raise ValueError(f"Line {line_number} is missing fields: {sorted(missing)}")
-            if not item["phone_ids"]:
-                raise ValueError(f"Line {line_number} has no phone IDs")
-            self.items.append(item)
-        if not self.items:
-            raise RuntimeError(f"No items in {path}")
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"Invalid JSON at {self.path}:{line_number}: {error}") from error
+        if not isinstance(item, dict):
+            raise ValueError(f"Expected a JSON object at {self.path}:{line_number}")
+        return item
+
+    def _validate(self, item: dict[str, Any], line_number: int) -> None:
+        required = {"utterance_id", "audio_path", "phone_ids"}
+        missing = required - item.keys()
+        if missing:
+            raise ValueError(f"{self.path}:{line_number} is missing fields: {sorted(missing)}")
+        if not item["phone_ids"]:
+            raise ValueError(f"{self.path}:{line_number} has no phone IDs")
+        start = float(item.get("start_seconds", 0.0))
+        if start < 0:
+            raise ValueError(f"{self.path}:{line_number} has negative start_seconds")
+        if "duration_seconds" in item and float(item["duration_seconds"]) <= 0:
+            raise ValueError(f"{self.path}:{line_number} has non-positive duration_seconds")
+        if item.get("sample_rate") is not None and int(item["sample_rate"]) <= 0:
+            raise ValueError(f"{self.path}:{line_number} has non-positive sample_rate")
+
+    def _stream(self) -> BinaryIO:
+        process_id = os.getpid()
+        if self._manifest is not None and self._manifest_pid != process_id:
+            self._manifest.close()
+            self._manifest = None
+        if self._manifest is None or self._manifest.closed:
+            self._manifest = self.path.open("rb")
+            self._manifest_pid = process_id
+        return self._manifest
+
+    def _item(self, index: int) -> dict[str, Any]:
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        stream = self._stream()
+        stream.seek(self.offsets[index])
+        line = stream.readline()
+        return self._decode(line, self.line_numbers[index])
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["_manifest"] = None
+        state["_manifest_pid"] = None
+        return state
+
+    def __del__(self) -> None:
+        manifest = getattr(self, "_manifest", None)
+        if manifest is not None:
+            manifest.close()
 
     def __len__(self) -> int:
-        return len(self.items)
+        return len(self.offsets)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        item = self.items[index]
-        waveform, sample_rate = torchaudio.load(item["audio_path"])
+        item = self._item(index)
+        audio_path = str(item["audio_path"])
+        start_seconds = float(item.get("start_seconds", 0.0))
+        duration_seconds = item.get("duration_seconds")
+        source_sample_rate = item.get("sample_rate")
+        if source_sample_rate is None:
+            source_sample_rate = torchaudio.info(audio_path).sample_rate
+        source_sample_rate = int(source_sample_rate)
+        frame_offset = round(start_seconds * source_sample_rate)
+        num_frames = (
+            round(float(duration_seconds) * source_sample_rate)
+            if duration_seconds is not None
+            else -1
+        )
+        waveform, sample_rate = torchaudio.load(
+            audio_path,
+            frame_offset=frame_offset,
+            num_frames=num_frames,
+        )
+        if waveform.numel() == 0:
+            raise RuntimeError(f"Audio cut is empty for {item['utterance_id']}")
+        if num_frames > 0 and waveform.shape[-1] != num_frames:
+            raise RuntimeError(
+                f"Audio cut is truncated for {item['utterance_id']}: "
+                f"requested_frames={num_frames}, loaded_frames={waveform.shape[-1]}"
+            )
+        if sample_rate != source_sample_rate:
+            raise RuntimeError(
+                f"Manifest sample_rate={source_sample_rate} differs from audio sample_rate="
+                f"{sample_rate} for {item['utterance_id']}"
+            )
         if waveform.shape[0] != 1:
             waveform = waveform.mean(0, keepdim=True)
         if sample_rate != self.sample_rate:

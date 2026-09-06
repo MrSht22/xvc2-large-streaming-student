@@ -183,8 +183,9 @@ SQLite 和主进程保留 2 核。LibriHeavy 扫描和最终写入保持单一�
 改变固定 seed 下的样本选择与 manifest 顺序。
 
 LibriHeavy 行指向 LibriLight raw 长录音，并保留 `start_seconds` 与 `duration_seconds`。
-当前 `PhoneManifestDataset` 尚未按这两个字段截取波形，因此这份 manifest 需要下一阶段的
-segment-aware DataLoader 更新后才能直接训练，不能把 raw 整段误当成一个 cut。
+`PhoneManifestDataset` 使用 JSONL 字节偏移进行懒加载，并按源音频采样率将这两个字段换算成
+frame offset 后只读取对应 cut；不会将 65 万行 manifest 或 LibriLight raw 长录音整体载入内存。
+每个 DataLoader worker 会独立打开 manifest 文件句柄。
 
 ```bash
 xvc2-student-audit manifest \
@@ -195,11 +196,17 @@ xvc2-student-audit teacher \
   --teacher /path/is24/models/checkpoint-8000 \
   --config configs/student_12x768.yaml \
   --device cuda:0
+
+xvc2-student-audit loader \
+  --manifest /path/student-manifest-2500h-v1/train.jsonl \
+  --batch-size 2 \
+  --num-workers 2
 ```
 
 第一条检查音频可读性、采样率、时长、重复 ID、phone ID 范围和 speaker/chapter split
 leakage。第二条拒绝 Git LFS pointer，并验证 Layer 20 为 1024 维、词表为 40 类以及
-Teacher/Student 50 Hz 帧长一致。
+Teacher/Student 50 Hz 帧长一致。第三条从 manifest 开头和首个 LibriHeavy 分段附近各读取
+少量样本，用于确认 JSONL 随机访问、raw 音频切片和多 worker DataLoader 均可运行。
 
 ## 资源 Benchmark
 
@@ -248,6 +255,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 \
 
 继续训练时传入 `--resume runs/.../step-XXXXXX.pt`。Checkpoint 包含模型、optimizer、
 scheduler、sampler epoch/position 和 Python/Torch/CUDA RNG state。
+首次正式训练建议先以单卡跑 50--100 step，确认共享存储吞吐和切片读取无误后再启动 DDP。
+多卡首轮保持 `--num-workers 0`；稳定后再从每个 rank 1 个 worker 开始测吞吐，因为该参数按
+rank 计数，不能直接按整机 CPU 核数填写。
 
 ## Flow-OPD 结论
 
