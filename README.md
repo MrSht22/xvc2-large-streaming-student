@@ -347,8 +347,9 @@ torchrun --standalone --nproc_per_node=4 \
   2>&1 | tee "$OUT/validate.log"
 ```
 
-输出 `report.json` 和 `report.md`，逐 checkpoint 报告：Teacher Layer 20 feature loss、phone
-CTC loss、`feature + 0.1 * CTC`、greedy CTC phone error rate (PER) 和整句 phone exact-match。
+输出 `report.json` 和 `report.md`，先用完整 Teacher forward 报告 Teacher CTC loss、greedy CTC
+phone error rate (PER) 和整句 phone exact-match，再逐 checkpoint 报告：Teacher Layer 20 feature
+loss、phone CTC loss、`feature + 0.1 * CTC`、PER 和整句 phone exact-match。
 其中 feature loss 按全部有效帧聚合，CTC loss 按全部 utterance 聚合，PER 按全部 reference
 phone 聚合，不对 batch 均值做二次平均。报告分别标记 weighted total loss 最低和 PER 最低的
 checkpoint；两者不一致时应保留两者进入后续 Codec/streaming downstream 验证，而不是只凭一个

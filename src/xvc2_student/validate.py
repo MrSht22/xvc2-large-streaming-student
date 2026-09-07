@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from .config import ExperimentConfig, load_config
 from .data import PhoneManifestDataset, collate
 from .model import StreamingPhoneEncoder
-from .teacher import load_teacher, optimized_teacher_targets, verify_optimized_teacher
+from .teacher import load_teacher, verify_optimized_teacher
 
 
 def validation_runtime(device_arg: str) -> tuple[torch.device, int, int, int]:
@@ -190,6 +190,7 @@ def make_report(
     dataset_items: int,
     world_size: int,
     elapsed_seconds: float,
+    teacher_statistics: torch.Tensor,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     for path, step, values in zip(checkpoint_paths, checkpoint_steps, statistics.tolist()):
@@ -214,6 +215,9 @@ def make_report(
                 "utterances": int(utterances),
             }
         )
+    teacher_ctc_sum, teacher_utterances, teacher_errors, teacher_phones, teacher_exact = (
+        teacher_statistics.tolist()
+    )
     return {
         "status": "PASS",
         "manifest": str(manifest),
@@ -223,6 +227,15 @@ def make_report(
         "loss_weights": {
             "feature": config.distillation.feature_weight,
             "ctc": config.distillation.ctc_weight,
+        },
+        "teacher_baseline": {
+            "ctc_loss": teacher_ctc_sum / max(teacher_utterances, 1.0),
+            "phone_error_rate": teacher_errors / max(teacher_phones, 1.0),
+            "phone_errors": int(teacher_errors),
+            "reference_phones": int(teacher_phones),
+            "phone_sequence_accuracy": teacher_exact / max(teacher_utterances, 1.0),
+            "exact_phone_sequences": int(teacher_exact),
+            "utterances": int(teacher_utterances),
         },
         "best_by_weighted_total_loss": min(
             results, key=lambda result: result["weighted_total_loss"]
@@ -244,6 +257,9 @@ def report_markdown(report: dict[str, Any]) -> str:
         f"- Elapsed seconds: {report['elapsed_seconds']:.2f}",
         f"- Best total loss: `{Path(report['best_by_weighted_total_loss']).name}`",
         f"- Best phone error rate: `{Path(report['best_by_phone_error_rate']).name}`",
+        f"- Teacher CTC loss: {report['teacher_baseline']['ctc_loss']:.6f}",
+        f"- Teacher PER: {report['teacher_baseline']['phone_error_rate']:.4%}",
+        f"- Teacher phone exact: {report['teacher_baseline']['phone_sequence_accuracy']:.4%}",
         "",
         "| Checkpoint | Step | Feature loss | CTC loss | Weighted total | PER | Phone exact |",
         "|---|---:|---:|---:|---:|---:|---:|",
@@ -346,6 +362,7 @@ def main() -> None:
             print(json.dumps({"checkpoint_loaded": str(path), "step": step}), flush=True)
 
     statistics = torch.zeros(len(models), 7, device=device, dtype=torch.float64)
+    teacher_statistics = torch.zeros(5, device=device, dtype=torch.float64)
     started = time.perf_counter()
     with torch.inference_mode():
         for batch_index, batch in enumerate(loader, 1):
@@ -354,12 +371,32 @@ def main() -> None:
             targets = batch["targets"].to(device, non_blocking=True)
             target_lengths = batch["target_lengths"].to(device, non_blocking=True)
             with torch.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-                teacher_hidden, teacher_lengths, convolution = optimized_teacher_targets(
-                    teacher,
+                raw_mask = torch.arange(waveform.shape[1], device=device)[None]
+                raw_mask = raw_mask < sample_lengths[:, None]
+                teacher_output = teacher(
                     waveform,
-                    sample_lengths,
-                    config.distillation.teacher_layer,
+                    attention_mask=raw_mask.long(),
+                    output_hidden_states=True,
+                    return_dict=True,
                 )
+                teacher_hidden = teacher_output.hidden_states[config.distillation.teacher_layer]
+                teacher_lengths = teacher._get_feat_extract_output_lengths(sample_lengths)
+                teacher_ctc_sum, teacher_errors, teacher_phones, teacher_exact = ctc_statistics(
+                    teacher_output.logits,
+                    targets,
+                    teacher_lengths,
+                    target_lengths,
+                )
+                teacher_statistics += torch.stack(
+                    (
+                        teacher_ctc_sum.double(),
+                        torch.tensor(float(len(batch["utterance_ids"])), device=device),
+                        torch.tensor(float(teacher_errors), device=device),
+                        torch.tensor(float(teacher_phones), device=device),
+                        torch.tensor(float(teacher_exact), device=device),
+                    )
+                )
+                convolution = models[0].feature_extractor(waveform)
                 for model_index, model in enumerate(models):
                     output = model(
                         waveform,
@@ -402,6 +439,7 @@ def main() -> None:
     elapsed = torch.tensor(time.perf_counter() - started, device=device, dtype=torch.float64)
     if world_size > 1:
         dist.all_reduce(statistics, op=dist.ReduceOp.SUM)
+        dist.all_reduce(teacher_statistics, op=dist.ReduceOp.SUM)
         dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
     if int(statistics[0, 3].item()) != len(dataset):
         raise RuntimeError(
@@ -418,6 +456,7 @@ def main() -> None:
             len(dataset),
             world_size,
             float(elapsed),
+            teacher_statistics.cpu(),
         )
         report["teacher_optimization_check"] = teacher_check
         args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -427,6 +466,7 @@ def main() -> None:
         (args.output_dir / "report.md").write_text(report_markdown(report), encoding="utf-8")
         for result in report["checkpoints"]:
             print(json.dumps(result), flush=True)
+        print(json.dumps({"teacher_baseline": report["teacher_baseline"]}), flush=True)
         print(
             json.dumps(
                 {
