@@ -31,10 +31,15 @@ from xvc2_student.teacher import (
     teacher_targets,
 )
 from xvc2_student.train import (
+    build_scheduler,
     collect_step_metrics,
     ddp_options,
+    extension_config,
     optimizer_step_due,
     override_max_steps,
+    runtime,
+    schedule_specification,
+    validate_prior_config_for_extension,
 )
 from xvc2_student.validate import (
     collapse_ctc,
@@ -384,6 +389,8 @@ def test_validation_feature_and_ctc_statistics() -> None:
 
 
 def test_training_runtime_helpers() -> None:
+    device, rank, world_size, local_rank = runtime("cpu")
+    assert (device.type, rank, world_size, local_rank) == ("cpu", 0, 1, 0)
     config = ExperimentConfig()
     overridden = override_max_steps(config, 20)
     assert config.training.max_steps == 200_000
@@ -415,6 +422,34 @@ def test_training_runtime_helpers() -> None:
     assert options["device_ids"] == [2]
     assert options["gradient_as_bucket_view"] is True
     assert "static_graph" not in options
+
+
+def test_extension_schedule_and_config_validation() -> None:
+    base = ExperimentConfig()
+    extended = extension_config(base, end_step=120, learning_rate=2.5e-5, warmup_ratio=0.1)
+    assert extended.training.max_steps == 120
+    assert extended.training.learning_rate == 2.5e-5
+    assert extended.training.warmup_ratio == 0.1
+
+    prior = base.to_dict()
+    prior["training"]["max_steps"] = 100
+    validate_prior_config_for_extension(prior, base)
+    prior["training"]["learning_rate"] = 2e-4
+    with pytest.raises(RuntimeError, match="base config"):
+        validate_prior_config_for_extension(prior, base)
+
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.SGD([parameter], lr=1e-4)
+    schedule = schedule_specification(100, 104, learning_rate=4e-4, warmup_ratio=0.5)
+    scheduler = build_scheduler(optimizer, schedule)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(2e-4)
+    optimizer.step()
+    scheduler.step()
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(4e-4)
+    for _ in range(3):
+        optimizer.step()
+        scheduler.step()
+    assert optimizer.param_groups[0]["lr"] == 0.0
 
 
 def test_checkpoint_roundtrip(tmp_path: Path) -> None:

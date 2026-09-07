@@ -43,11 +43,9 @@ def runtime(device_arg: str) -> tuple[torch.device, int, int, int]:
         torch.cuda.set_device(local_rank)
         dist.init_process_group("nccl")
         return torch.device(f"cuda:{local_rank}"), rank, world_size, local_rank
-    device = torch.device(
-        "cuda" if device_arg == "auto" and torch.cuda.is_available() else device_arg
-    )
-    if device_arg == "auto" and not torch.cuda.is_available():
-        device = torch.device("cpu")
+    if device_arg == "auto":
+        device_arg = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device_arg)
     return device, rank, world_size, local_rank
 
 
@@ -55,6 +53,82 @@ def override_max_steps(config: ExperimentConfig, max_steps: int | None) -> Exper
     if max_steps is None:
         return config
     return replace(config, training=replace(config.training, max_steps=max_steps))
+
+
+def extension_config(
+    config: ExperimentConfig,
+    end_step: int,
+    learning_rate: float,
+    warmup_ratio: float,
+) -> ExperimentConfig:
+    return replace(
+        config,
+        training=replace(
+            config.training,
+            max_steps=end_step,
+            learning_rate=learning_rate,
+            warmup_ratio=warmup_ratio,
+        ),
+    )
+
+
+def schedule_specification(
+    start_step: int,
+    end_step: int,
+    learning_rate: float,
+    warmup_ratio: float,
+) -> dict[str, Any]:
+    if not 0 <= start_step < end_step:
+        raise ValueError("Schedule requires 0 <= start_step < end_step")
+    if learning_rate <= 0 or not 0.0 <= warmup_ratio < 1.0:
+        raise ValueError("Invalid schedule learning rate or warmup ratio")
+    return {
+        "kind": "linear_warmup_decay",
+        "start_step": start_step,
+        "end_step": end_step,
+        "learning_rate": learning_rate,
+        "warmup_ratio": warmup_ratio,
+    }
+
+
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    specification: dict[str, Any],
+    preserve_current_learning_rates: bool = False,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    phase_steps = int(specification["end_step"]) - int(specification["start_step"])
+    warmup = max(1, round(phase_steps * float(specification["warmup_ratio"])))
+    peak_learning_rate = float(specification["learning_rate"])
+    current_learning_rates = [group["lr"] for group in optimizer.param_groups]
+    for group in optimizer.param_groups:
+        group["lr"] = peak_learning_rate
+        group["initial_lr"] = peak_learning_rate
+
+    def multiplier(phase_step: int) -> float:
+        if phase_step < warmup:
+            return (phase_step + 1) / warmup
+        return max(phase_steps - phase_step, 0) / max(phase_steps - warmup, 1)
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
+    if preserve_current_learning_rates:
+        for group, learning_rate in zip(optimizer.param_groups, current_learning_rates):
+            group["lr"] = learning_rate
+    return scheduler
+
+
+def validate_prior_config_for_extension(
+    checkpoint_config: dict[str, Any], base_config: ExperimentConfig
+) -> None:
+    expected = base_config.to_dict()
+    actual = dict(checkpoint_config)
+    actual_training = dict(actual.get("training", {}))
+    expected_training = dict(expected["training"])
+    actual_training.pop("max_steps", None)
+    expected_training.pop("max_steps", None)
+    actual["training"] = actual_training
+    expected["training"] = expected_training
+    if actual != expected:
+        raise RuntimeError("Extension checkpoint config differs from the base config")
 
 
 def optimizer_step_due(micro_step: int, grad_accum: int) -> bool:
@@ -147,6 +221,9 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--extension-end-step", type=int)
+    parser.add_argument("--extension-learning-rate", type=float, default=2.5e-5)
+    parser.add_argument("--extension-warmup-ratio", type=float, default=0.05)
     parser.add_argument("--teacher-attention", choices=("eager", "sdpa"), default="eager")
     parser.add_argument("--full-teacher-forward", action="store_true")
     parser.add_argument("--no-shared-frontend", action="store_true")
@@ -170,8 +247,27 @@ def main() -> None:
         parser.error("num-workers cannot be negative")
     if args.max_steps is not None and args.max_steps <= 0:
         parser.error("max-steps must be positive")
+    if args.extension_end_step is not None:
+        if args.resume is None:
+            parser.error("extension-end-step requires --resume")
+        if args.max_steps is not None:
+            parser.error("extension-end-step and max-steps cannot be used together")
+        if args.extension_end_step <= 0 or args.extension_learning_rate <= 0:
+            parser.error("Extension end step and learning rate must be positive")
+        if not 0.0 <= args.extension_warmup_ratio < 1.0:
+            parser.error("extension-warmup-ratio must be in [0, 1)")
 
-    config = override_max_steps(load_config(args.config), args.max_steps)
+    base_config = load_config(args.config)
+    config = (
+        extension_config(
+            base_config,
+            args.extension_end_step,
+            args.extension_learning_rate,
+            args.extension_warmup_ratio,
+        )
+        if args.extension_end_step is not None
+        else override_max_steps(base_config, args.max_steps)
+    )
     if config.distillation.streaming_consistency_weight:
         raise ValueError(
             "Streaming-state training is an experimental second-stage option, not enabled here"
@@ -237,24 +333,61 @@ def main() -> None:
         weight_decay=config.training.weight_decay,
         **optimizer_options,
     )
-    warmup = max(1, round(config.training.max_steps * config.training.warmup_ratio))
-
-    def multiplier(step: int) -> float:
-        if step < warmup:
-            return (step + 1) / warmup
-        return max(config.training.max_steps - step, 0) / max(config.training.max_steps - warmup, 1)
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
     use_amp = device.type == "cuda" and config.training.amp != "none"
     amp_dtype = torch.bfloat16 if config.training.amp == "bf16" else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and config.training.amp == "fp16")
     step = 0
+    payload: dict[str, Any] | None = None
     if args.resume:
-        payload = load_checkpoint(args.resume, model, optimizer, scheduler, scaler)
-        if payload["config"] != config.to_dict():
-            raise RuntimeError("Resume config differs from the current config")
+        payload = load_checkpoint(args.resume, model, optimizer, scaler=scaler)
         sampler.load_state_dict(payload["data_state"]["sampler"])
         step = int(payload["step"])
+    loaded_schedule = payload.get("data_state", {}).get("schedule") if payload else None
+    if args.extension_end_step is not None:
+        if step >= args.extension_end_step:
+            raise RuntimeError("Extension end step must be greater than the checkpoint step")
+        resuming_extension = bool(loaded_schedule and int(loaded_schedule["start_step"]) > 0)
+        if resuming_extension:
+            expected_schedule = schedule_specification(
+                int(loaded_schedule["start_step"]),
+                args.extension_end_step,
+                args.extension_learning_rate,
+                args.extension_warmup_ratio,
+            )
+            if loaded_schedule != expected_schedule or payload["config"] != config.to_dict():
+                raise RuntimeError("Extension settings differ from the continuation checkpoint")
+            schedule = loaded_schedule
+            scheduler = build_scheduler(optimizer, schedule, preserve_current_learning_rates=True)
+            scheduler.load_state_dict(payload["scheduler"])
+        else:
+            if step != int(payload["config"]["training"]["max_steps"]):
+                raise RuntimeError("Start an extension from a completed training checkpoint")
+            validate_prior_config_for_extension(payload["config"], base_config)
+            schedule = schedule_specification(
+                step,
+                args.extension_end_step,
+                args.extension_learning_rate,
+                args.extension_warmup_ratio,
+            )
+            scheduler = build_scheduler(optimizer, schedule)
+    else:
+        if payload and payload["config"] != config.to_dict():
+            raise RuntimeError("Resume config differs from the current config")
+        if loaded_schedule and int(loaded_schedule["start_step"]) > 0:
+            raise RuntimeError("Resume an extension checkpoint with --extension-end-step")
+        schedule = loaded_schedule or schedule_specification(
+            0,
+            config.training.max_steps,
+            config.training.learning_rate,
+            config.training.warmup_ratio,
+        )
+        scheduler = build_scheduler(
+            optimizer,
+            schedule,
+            preserve_current_learning_rates=payload is not None,
+        )
+        if payload:
+            scheduler.load_state_dict(payload["scheduler"])
     training_model: torch.nn.Module = model
     ddp_model: DistributedDataParallel | None = None
     if world_size > 1:
@@ -273,6 +406,12 @@ def main() -> None:
                 verification_lengths,
                 config.distillation.teacher_layer,
             )
+    batches_remaining_at_start = len(loader)
+    if dynamic_batching:
+        batches_per_epoch = batches_remaining_at_start + sampler.position
+    else:
+        items_per_epoch = len(sampler) + sampler.position
+        batches_per_epoch = (items_per_epoch + args.batch_size - 1) // args.batch_size
     if rank == 0:
         print(
             json.dumps(
@@ -305,7 +444,9 @@ def main() -> None:
                             not args.full_teacher_forward and not args.no_shared_frontend
                         ),
                         "fused_adamw": device.type == "cuda",
-                        "batches_per_epoch_per_rank": len(sampler),
+                        "schedule": schedule,
+                        "batches_per_epoch_per_rank": batches_per_epoch,
+                        "batches_remaining_at_start_per_rank": batches_remaining_at_start,
                         "dynamic_padding_batches": (
                             sampler.padding_batches if dynamic_batching else None
                         ),
@@ -416,8 +557,9 @@ def main() -> None:
                 window_started = time.perf_counter()
                 if device.type == "cuda":
                     torch.cuda.reset_peak_memory_stats(device)
+            phase_step = step - int(schedule["start_step"])
             should_save = (
-                step % config.training.save_interval == 0 or step == config.training.max_steps
+                phase_step % config.training.save_interval == 0 or step == config.training.max_steps
             )
             if should_save:
                 if rank == 0:
@@ -429,7 +571,7 @@ def main() -> None:
                         optimizer,
                         scheduler,
                         scaler,
-                        {"sampler": sampler.state_dict()},
+                        {"sampler": sampler.state_dict(), "schedule": schedule},
                     )
                 if world_size > 1:
                     dist.barrier()

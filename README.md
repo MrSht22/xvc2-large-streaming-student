@@ -313,6 +313,51 @@ PYTHONPATH=src torchrun --standalone --nproc_per_node=4 \
 `mean_global_batch_size` 给出每个统计窗口的实际均值。20-step 只用于速度和显存检查，因为
 `--max-steps 20` 也会让学习率调度器在第 20 步降到零，不能据此判断正式训练收敛。
 
+### 延长已完成的训练
+
+当原 scheduler 已在 `step-039876.pt` 降到零时，不要通过普通 `--resume` 修改总步数。使用显式
+extension mode 保留模型、AdamW moments、AMP scaler、sampler 和 RNG，并为额外一个 epoch
+建立独立的低学习率 warmup + linear decay：
+
+```bash
+BASE=/inspire/hdd2/project/multilingualspeechrecognition/chenxie-25019/qixiangxu
+MANIFEST="$PWD/runs/student-manifest-2500h-v1/train.jsonl"
+TEACHER="$BASE/models/checkpoint-8000"
+SOURCE="$PWD/runs/student-12x768-2500h-3epoch-v1/step-039876.pt"
+OUT="$PWD/runs/student-12x768-2500h-extension-1epoch-v1"
+
+mkdir -p "$OUT"
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+OMP_NUM_THREADS=1 \
+NCCL_DEBUG=WARN \
+PYTHONUNBUFFERED=1 \
+PYTHONPATH=src \
+torchrun --standalone --nproc_per_node=4 \
+  -m xvc2_student.train \
+  --config configs/student_12x768.yaml \
+  --manifest "$MANIFEST" \
+  --teacher "$TEACHER" \
+  --output-dir "$OUT" \
+  --resume "$SOURCE" \
+  --max-batch-audio-seconds 180 \
+  --max-batch-items 32 \
+  --duration-bucket-size 2048 \
+  --grad-accum 1 \
+  --num-workers 2 \
+  --prefetch-factor 2 \
+  --teacher-attention sdpa \
+  --extension-end-step 53168 \
+  --extension-learning-rate 2.5e-5 \
+  --extension-warmup-ratio 0.05 \
+  2>&1 | tee "$OUT/train.log"
+```
+
+该阶段相对起点每 5000 steps 保存一次，因此生成 `step-044876.pt`、`step-049876.pt` 和最终
+`step-053168.pt`。若中断，将 `--resume` 改为 extension 目录中最新 checkpoint，其他 extension
+参数保持完全一致。checkpoint 中保存独立 schedule 描述，错误的 end step、学习率或 warmup 会被
+拒绝，避免静默改变恢复轨迹。
+
 ## Checkpoint Validation
 
 训练完成后，用四卡一次验证目录下全部 `step-*.pt`。Teacher target 对每个 validation batch
