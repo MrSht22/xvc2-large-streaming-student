@@ -15,6 +15,7 @@ from .config import load_config
 from .data import PhoneManifestDataset, collate
 from .model import StreamingPhoneEncoder
 from .teacher import load_teacher_with_loading_info, loading_failures, teacher_targets
+from .validate import load_student_checkpoint
 
 
 def audio_metadata(path: Path) -> tuple[int, int]:
@@ -248,6 +249,183 @@ def audit_teacher(
     return {**details, "failures": failures, "status": "PASS" if not failures else "FAIL"}
 
 
+def streaming_forward(
+    model: StreamingPhoneEncoder,
+    waveform: torch.Tensor,
+    chunk_samples: int,
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    if chunk_samples <= 0:
+        raise ValueError("chunk_samples must be positive")
+    state = model.init_streaming_state(waveform.device, waveform.dtype)
+    outputs: dict[str, list[torch.Tensor]] = {
+        "hidden_states": [],
+        "distill_features": [],
+        "phone_logits": [],
+    }
+    emitted_before_flush = 0
+    pattern = (
+        max(1, chunk_samples // 3),
+        chunk_samples,
+        chunk_samples + model.stride_samples // 2,
+        max(1, chunk_samples - model.stride_samples // 3),
+    )
+    offset = 0
+    chunk_index = 0
+    while offset < waveform.shape[1]:
+        count = min(pattern[chunk_index % len(pattern)], waveform.shape[1] - offset)
+        chunk_output, state = model.forward_chunk(
+            waveform[:, offset : offset + count], state, is_final=False
+        )
+        for name in outputs:
+            outputs[name].append(chunk_output[name])
+        emitted_before_flush += int(chunk_output["output_lengths"][0])
+        offset += count
+        chunk_index += 1
+    flush_output, state = model.forward_chunk(waveform[:, :0], state, is_final=True)
+    for name in outputs:
+        outputs[name].append(flush_output[name])
+    flush_frames = int(flush_output["output_lengths"][0])
+    finalized_rejected = False
+    try:
+        model.forward_chunk(waveform[:, :0], state, is_final=True)
+    except RuntimeError:
+        finalized_rejected = True
+    return (
+        {name: torch.cat(values, dim=1) for name, values in outputs.items()},
+        {
+            "chunks": chunk_index,
+            "emitted_before_flush": emitted_before_flush,
+            "flush_frames": flush_frames,
+            "state_finalized": state.finalized,
+            "waveform_buffer_samples": state.waveform_buffer.shape[1],
+            "feature_buffer_frames": state.feature_buffer.shape[1],
+            "finalized_state_rejected_reuse": finalized_rejected,
+        },
+    )
+
+
+def compare_streaming(
+    model: StreamingPhoneEncoder,
+    waveform: torch.Tensor,
+    chunk_samples: int,
+    tolerance: float,
+) -> dict[str, Any]:
+    if waveform.ndim == 1:
+        waveform = waveform[None]
+    if waveform.ndim != 2 or waveform.shape[0] != 1:
+        raise ValueError("Expected one waveform with shape [1, samples]")
+    sample_lengths = torch.tensor([waveform.shape[1]], device=waveform.device)
+    with torch.inference_mode():
+        offline = model(waveform, sample_lengths)
+        chunked, streaming_state = streaming_forward(model, waveform, chunk_samples)
+        reset_chunked, reset_state = streaming_forward(model, waveform, chunk_samples)
+
+    expected_frames = int(offline["output_lengths"][0])
+    output_frames = chunked["hidden_states"].shape[1]
+    comparisons: dict[str, dict[str, float]] = {}
+    failures: list[str] = []
+    for name in ("hidden_states", "distill_features", "phone_logits"):
+        if offline[name].shape != chunked[name].shape:
+            failures.append(f"{name}_shape_mismatch")
+            continue
+        difference = (offline[name] - chunked[name]).abs().float()
+        reset_difference = (chunked[name] - reset_chunked[name]).abs().float()
+        comparisons[name] = {
+            "max_abs_difference": float(difference.max()) if difference.numel() else 0.0,
+            "mean_abs_difference": float(difference.mean()) if difference.numel() else 0.0,
+            "reset_max_abs_difference": (
+                float(reset_difference.max()) if reset_difference.numel() else 0.0
+            ),
+        }
+        if comparisons[name]["max_abs_difference"] > tolerance:
+            failures.append(f"{name}_difference_exceeds_tolerance")
+        if comparisons[name]["reset_max_abs_difference"] > tolerance:
+            failures.append(f"{name}_reset_difference_exceeds_tolerance")
+    if output_frames != expected_frames:
+        failures.append("output_frame_count_mismatch")
+    for name, value in {
+        "state_not_finalized": not streaming_state["state_finalized"],
+        "waveform_buffer_not_empty": streaming_state["waveform_buffer_samples"] != 0,
+        "feature_buffer_not_empty": streaming_state["feature_buffer_frames"] != 0,
+        "finalized_state_accepted_reuse": not streaming_state["finalized_state_rejected_reuse"],
+        "reset_state_not_finalized": not reset_state["state_finalized"],
+    }.items():
+        if value:
+            failures.append(name)
+    return {
+        "samples": waveform.shape[1],
+        "expected_frames": expected_frames,
+        "streaming_frames": output_frames,
+        **streaming_state,
+        "comparisons": comparisons,
+        "failures": failures,
+        "status": "PASS" if not failures else "FAIL",
+    }
+
+
+def audit_streaming(
+    checkpoint: Path,
+    config_path: Path,
+    manifest: Path,
+    device: str = "cpu",
+    num_items: int = 8,
+    chunk_samples: int = 3_200,
+    tolerance: float = 2e-3,
+) -> dict[str, Any]:
+    if num_items <= 0 or chunk_samples <= 0 or tolerance < 0:
+        raise ValueError("Streaming audit limits must be positive")
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    resolved_device = torch.device(device)
+    config = load_config(config_path)
+    model, step = load_student_checkpoint(checkpoint, config, resolved_device)
+    dataset = PhoneManifestDataset(manifest)
+    count = min(num_items, len(dataset))
+    indices = (
+        [0]
+        if count == 1
+        else sorted({round(index * (len(dataset) - 1) / (count - 1)) for index in range(count)})
+    )
+    items: list[dict[str, Any]] = []
+    failures: list[str] = []
+    torch.set_float32_matmul_precision("highest")
+    if resolved_device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+    for index in indices:
+        item = dataset[index]
+        result = compare_streaming(
+            model,
+            item["waveform"].to(resolved_device)[None],
+            chunk_samples,
+            tolerance,
+        )
+        result.update({"index": index, "utterance_id": item["utterance_id"]})
+        items.append(result)
+        failures.extend(f"{item['utterance_id']}:{failure}" for failure in result["failures"])
+    maximums: dict[str, float | None] = {}
+    for name in ("hidden_states", "distill_features", "phone_logits"):
+        values = [
+            item["comparisons"][name]["max_abs_difference"]
+            for item in items
+            if name in item["comparisons"]
+        ]
+        maximums[name] = max(values) if len(values) == len(items) else None
+    return {
+        "checkpoint": str(checkpoint),
+        "checkpoint_step": step,
+        "manifest": str(manifest),
+        "device": str(resolved_device),
+        "items_checked": len(items),
+        "chunk_samples": chunk_samples,
+        "chunk_milliseconds": 1_000 * chunk_samples / dataset.sample_rate,
+        "tolerance": tolerance,
+        "maximum_abs_differences": maximums,
+        "items": items,
+        "failures": failures,
+        "status": "PASS" if not failures else "FAIL",
+    }
+
+
 def emit(report: dict[str, Any], label: str) -> None:
     print(json.dumps(report, sort_keys=True))
     print(f"{label}={report['status']}")
@@ -273,6 +451,14 @@ def main() -> None:
     teacher_parser.add_argument("--config", type=Path, required=True)
     teacher_parser.add_argument("--device", default="cpu")
     teacher_parser.add_argument("--seconds", type=float, default=0.5)
+    streaming_parser = subparsers.add_parser("streaming")
+    streaming_parser.add_argument("--checkpoint", type=Path, required=True)
+    streaming_parser.add_argument("--config", type=Path, required=True)
+    streaming_parser.add_argument("--manifest", type=Path, required=True)
+    streaming_parser.add_argument("--device", default="auto")
+    streaming_parser.add_argument("--num-items", type=int, default=8)
+    streaming_parser.add_argument("--chunk-samples", type=int, default=3_200)
+    streaming_parser.add_argument("--tolerance", type=float, default=2e-3)
     args = parser.parse_args()
     if args.command == "manifest":
         emit(
@@ -287,6 +473,19 @@ def main() -> None:
         emit(
             audit_teacher(args.teacher.resolve(), args.config.resolve(), args.device, args.seconds),
             "student_teacher_audit",
+        )
+    elif args.command == "streaming":
+        emit(
+            audit_streaming(
+                args.checkpoint.expanduser().resolve(),
+                args.config.expanduser().resolve(),
+                args.manifest.expanduser().resolve(),
+                args.device,
+                args.num_items,
+                args.chunk_samples,
+                args.tolerance,
+            ),
+            "student_streaming_audit",
         )
     else:
         emit(

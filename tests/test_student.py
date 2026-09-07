@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import Wav2Vec2Config, Wav2Vec2ForCTC
 
-from xvc2_student.audit import audit_loader, audit_manifests
+from xvc2_student.audit import audit_loader, audit_manifests, compare_streaming
 from xvc2_student.build_audio_manifest import build_manifests, select_librilight
 from xvc2_student.build_student_manifest import PhoneConversionPool, build_student_manifests
 from xvc2_student.checkpoint import load_checkpoint, save_checkpoint
@@ -228,6 +228,25 @@ def test_forward_and_feature_loss() -> None:
     )
     loss.backward()
     assert torch.isfinite(loss)
+
+
+def test_offline_and_raw_chunk_streaming_are_equivalent() -> None:
+    model = StreamingPhoneEncoder(tiny_config()).eval()
+    samples = model.receptive_field_samples + model.stride_samples * 14 + 3
+    report = compare_streaming(
+        model,
+        torch.randn(1, samples),
+        chunk_samples=17,
+        tolerance=2e-6,
+    )
+    assert report["status"] == "PASS"
+    assert report["streaming_frames"] == report["expected_frames"] == 15
+    assert report["chunks"] > 1
+    assert report["flush_frames"] > 0
+    assert report["state_finalized"] is True
+    assert report["waveform_buffer_samples"] == 0
+    assert report["feature_buffer_frames"] == 0
+    assert report["finalized_state_rejected_reuse"] is True
 
 
 def test_student_reuses_convolution_features() -> None:

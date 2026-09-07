@@ -400,6 +400,35 @@ phone 聚合，不对 batch 均值做二次平均。报告分别标记 weighted 
 checkpoint；两者不一致时应保留两者进入后续 Codec/streaming downstream 验证，而不是只凭一个
 指标删除 checkpoint。
 
+### Streaming 等价性验证
+
+选定 checkpoint 后，用真实 test 音频验证 offline forward 与不规则 raw-audio chunk 输入的一致性，
+并检查尾部空 chunk flush、state reset、finalized state 防复用和输出帧数：
+
+```bash
+CHECKPOINT="$PWD/runs/student-12x768-2500h-extension-1epoch-v1/step-053168.pt"
+MANIFEST="$PWD/runs/student-manifest-2500h-v1/test.jsonl"
+OUT="$PWD/runs/student-12x768-streaming-audit"
+
+mkdir -p "$OUT"
+
+CUDA_VISIBLE_DEVICES=0 \
+PYTHONPATH=src \
+python -m xvc2_student.audit streaming \
+  --checkpoint "$CHECKPOINT" \
+  --config configs/student_12x768.yaml \
+  --manifest "$MANIFEST" \
+  --device cuda:0 \
+  --num-items 8 \
+  --chunk-samples 3200 \
+  --tolerance 0.002 \
+  2>&1 | tee "$OUT/streaming-audit.log"
+```
+
+默认 chunk 为 200 ms。抽样位置均匀覆盖 test manifest；每条音频内部循环使用不对齐卷积 stride
+的不规则 chunk，防止只验证理想整帧边界。只有所有输出张量误差、帧数、flush 和 state 检查均通过
+才输出 `student_streaming_audit=PASS`。
+
 ## Flow-OPD 结论
 
 详见 `docs/FLOW_OPD_ASSESSMENT.md`。Flow-OPD 不直接适用于当前异构的 Wav2Vec2
