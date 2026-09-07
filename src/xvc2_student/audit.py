@@ -15,7 +15,7 @@ from .config import load_config
 from .data import PhoneManifestDataset, collate
 from .model import StreamingPhoneEncoder
 from .teacher import load_teacher_with_loading_info, loading_failures, teacher_targets
-from .validate import load_student_checkpoint
+from .validate import collapse_ctc, edit_distance, load_student_checkpoint
 
 
 def audio_metadata(path: Path) -> tuple[int, int]:
@@ -322,7 +322,7 @@ def compare_streaming(
 
     expected_frames = int(offline["output_lengths"][0])
     output_frames = chunked["hidden_states"].shape[1]
-    comparisons: dict[str, dict[str, float]] = {}
+    comparisons: dict[str, dict[str, float | int]] = {}
     failures: list[str] = []
     for name in ("hidden_states", "distill_features", "phone_logits"):
         if offline[name].shape != chunked[name].shape:
@@ -330,9 +330,37 @@ def compare_streaming(
             continue
         difference = (offline[name] - chunked[name]).abs().float()
         reset_difference = (chunked[name] - reset_chunked[name]).abs().float()
+        flattened = difference.flatten()
+        maximum_index = int(flattened.argmax()) if flattened.numel() else 0
+        feature_dimension = difference.shape[-1]
+        reference_rms = offline[name].float().square().mean().sqrt()
         comparisons[name] = {
             "max_abs_difference": float(difference.max()) if difference.numel() else 0.0,
             "mean_abs_difference": float(difference.mean()) if difference.numel() else 0.0,
+            "p99_abs_difference": (
+                float(torch.quantile(flattened, 0.99)) if flattened.numel() else 0.0
+            ),
+            "p999_abs_difference": (
+                float(torch.quantile(flattened, 0.999)) if flattened.numel() else 0.0
+            ),
+            "root_mean_square_difference": (
+                float(difference.square().mean().sqrt()) if difference.numel() else 0.0
+            ),
+            "reference_root_mean_square": float(reference_rms),
+            "normalized_root_mean_square_difference": (
+                float(difference.square().mean().sqrt() / reference_rms.clamp_min(1e-12))
+                if difference.numel()
+                else 0.0
+            ),
+            "values_above_tolerance": int((difference > tolerance).sum()),
+            "fraction_above_tolerance": (
+                float((difference > tolerance).float().mean()) if difference.numel() else 0.0
+            ),
+            "max_difference_frame": maximum_index // feature_dimension,
+            "max_difference_channel": maximum_index % feature_dimension,
+            "reference_abs_at_max_difference": (
+                float(offline[name].flatten()[maximum_index].abs()) if flattened.numel() else 0.0
+            ),
             "reset_max_abs_difference": (
                 float(reset_difference.max()) if reset_difference.numel() else 0.0
             ),
@@ -341,6 +369,18 @@ def compare_streaming(
             failures.append(f"{name}_difference_exceeds_tolerance")
         if comparisons[name]["reset_max_abs_difference"] > tolerance:
             failures.append(f"{name}_reset_difference_exceeds_tolerance")
+    offline_tokens = offline["phone_logits"].argmax(-1)[0, :expected_frames].tolist()
+    streaming_tokens = chunked["phone_logits"].argmax(-1)[0, :output_frames].tolist()
+    compared_frames = min(len(offline_tokens), len(streaming_tokens))
+    token_disagreements = sum(
+        first != second
+        for first, second in zip(
+            offline_tokens[:compared_frames], streaming_tokens[:compared_frames]
+        )
+    ) + abs(len(offline_tokens) - len(streaming_tokens))
+    offline_collapsed = collapse_ctc(offline_tokens)
+    streaming_collapsed = collapse_ctc(streaming_tokens)
+    collapsed_distance = edit_distance(offline_collapsed, streaming_collapsed)
     if output_frames != expected_frames:
         failures.append("output_frame_count_mismatch")
     for name, value in {
@@ -356,6 +396,10 @@ def compare_streaming(
         "samples": waveform.shape[1],
         "expected_frames": expected_frames,
         "streaming_frames": output_frames,
+        "phone_argmax_disagreements": token_disagreements,
+        "phone_argmax_disagreement_rate": token_disagreements / max(expected_frames, 1),
+        "collapsed_phone_edit_distance": collapsed_distance,
+        "collapsed_phone_sequences_equal": collapsed_distance == 0,
         **streaming_state,
         "comparisons": comparisons,
         "failures": failures,

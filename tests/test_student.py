@@ -247,6 +247,12 @@ def test_offline_and_raw_chunk_streaming_are_equivalent() -> None:
     assert report["waveform_buffer_samples"] == 0
     assert report["feature_buffer_frames"] == 0
     assert report["finalized_state_rejected_reuse"] is True
+    assert report["phone_argmax_disagreements"] == 0
+    assert report["collapsed_phone_sequences_equal"] is True
+    assert all(
+        comparison["normalized_root_mean_square_difference"] < 1e-6
+        for comparison in report["comparisons"].values()
+    )
 
 
 def test_student_reuses_convolution_features() -> None:
