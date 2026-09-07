@@ -313,6 +313,47 @@ PYTHONPATH=src torchrun --standalone --nproc_per_node=4 \
 `mean_global_batch_size` 给出每个统计窗口的实际均值。20-step 只用于速度和显存检查，因为
 `--max-steps 20` 也会让学习率调度器在第 20 步降到零，不能据此判断正式训练收敛。
 
+## Checkpoint Validation
+
+训练完成后，用四卡一次验证目录下全部 `step-*.pt`。Teacher target 对每个 validation batch
+只计算一次，随后依次运行全部 Student checkpoint；validation 样本按 rank 无重复切分：
+
+```bash
+BASE=/inspire/hdd2/project/multilingualspeechrecognition/chenxie-25019/qixiangxu
+CHECKPOINT_DIR="$PWD/runs/student-12x768-2500h-3epoch-v1"
+MANIFEST="$PWD/runs/student-manifest-2500h-v1/validation.jsonl"
+TEACHER="$BASE/models/checkpoint-8000"
+OUT="$CHECKPOINT_DIR/validation"
+
+mkdir -p "$OUT"
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+OMP_NUM_THREADS=1 \
+NCCL_DEBUG=WARN \
+PYTHONUNBUFFERED=1 \
+PYTHONPATH=src \
+torchrun --standalone --nproc_per_node=4 \
+  -m xvc2_student.validate \
+  --config configs/student_12x768.yaml \
+  --manifest "$MANIFEST" \
+  --teacher "$TEACHER" \
+  --checkpoint-dir "$CHECKPOINT_DIR" \
+  --output-dir "$OUT" \
+  --max-batch-audio-seconds 180 \
+  --max-batch-items 32 \
+  --num-workers 2 \
+  --prefetch-factor 2 \
+  --teacher-attention sdpa \
+  2>&1 | tee "$OUT/validate.log"
+```
+
+输出 `report.json` 和 `report.md`，逐 checkpoint 报告：Teacher Layer 20 feature loss、phone
+CTC loss、`feature + 0.1 * CTC`、greedy CTC phone error rate (PER) 和整句 phone exact-match。
+其中 feature loss 按全部有效帧聚合，CTC loss 按全部 utterance 聚合，PER 按全部 reference
+phone 聚合，不对 batch 均值做二次平均。报告分别标记 weighted total loss 最低和 PER 最低的
+checkpoint；两者不一致时应保留两者进入后续 Codec/streaming downstream 验证，而不是只凭一个
+指标删除 checkpoint。
+
 ## Flow-OPD 结论
 
 详见 `docs/FLOW_OPD_ASSESSMENT.md`。Flow-OPD 不直接适用于当前异构的 Wav2Vec2

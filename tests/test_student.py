@@ -36,6 +36,13 @@ from xvc2_student.train import (
     optimizer_step_due,
     override_max_steps,
 )
+from xvc2_student.validate import (
+    collapse_ctc,
+    ctc_statistics,
+    edit_distance,
+    feature_statistics,
+    pack_validation_batches,
+)
 
 
 def tiny_teacher_config(
@@ -317,6 +324,63 @@ def test_distributed_dynamic_batches_are_deterministic_and_balanced() -> None:
     )
     restored.load_state_dict(state)
     assert list(restored) == batches[0][1:]
+
+
+def test_validation_batches_cover_dataset_once_within_budget() -> None:
+    sample_counts = [10, 11, 12, 20, 21, 22, 30, 31, 32, 40, 41]
+    batches_by_rank = [
+        pack_validation_batches(
+            sample_counts,
+            rank=rank,
+            world_size=3,
+            max_batch_samples=80,
+            max_batch_items=3,
+        )
+        for rank in range(3)
+    ]
+    indices = [index for batches in batches_by_rank for batch in batches for index in batch]
+    assert sorted(indices) == list(range(len(sample_counts)))
+    assert len(indices) == len(set(indices))
+    for batches in batches_by_rank:
+        for batch in batches:
+            assert len(batch) <= 3
+            assert max(sample_counts[index] for index in batch) * len(batch) <= 80
+
+
+def test_ctc_collapse_and_edit_distance() -> None:
+    assert collapse_ctc([0, 1, 1, 0, 1, 2, 2, 0]) == [1, 1, 2]
+    assert edit_distance([1, 2, 3], [1, 4, 3]) == 1
+    assert edit_distance([1, 2], [1, 2, 3]) == 1
+    assert edit_distance([1, 2, 3], [1, 3]) == 1
+
+
+def test_validation_feature_and_ctc_statistics() -> None:
+    predicted = torch.randn(2, 4, 6)
+    target = torch.randn(2, 4, 6)
+    lengths = torch.tensor([4, 2])
+    feature_sum, feature_frames = feature_statistics(predicted, target, lengths)
+    expected = valid_feature_loss(predicted, target, lengths)
+    assert int(feature_frames) == 6
+    torch.testing.assert_close(feature_sum / feature_frames, expected)
+
+    token_predictions = torch.tensor(
+        [
+            [1, 1, 0, 2],
+            [1, 0, 3, 3],
+        ]
+    )
+    logits = torch.full((2, 4, 4), -8.0)
+    logits.scatter_(2, token_predictions.unsqueeze(-1), 8.0)
+    ctc_sum, errors, reference_phones, exact = ctc_statistics(
+        logits,
+        targets=torch.tensor([1, 2, 1, 2]),
+        input_lengths=torch.tensor([4, 4]),
+        target_lengths=torch.tensor([2, 2]),
+    )
+    assert torch.isfinite(ctc_sum)
+    assert errors == 1
+    assert reference_phones == 4
+    assert exact == 1
 
 
 def test_training_runtime_helpers() -> None:
